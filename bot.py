@@ -928,8 +928,7 @@ def locked_text() -> str:
     return (
         f"🔒 *Vault Locked*\n\n"
         f"Session expired after {SESSION_TTL // 60} min of inactivity.\n"
-        f"Tap *🔓 Unlock Vault* or enter your passcode.\n\n"
-        f"_Forgot your passcode? Tap_ *🆘 Forgot Passcode? Appeal Reset* _to request a reset._"
+        f"Tap *🔓 Unlock Vault* or enter your passcode."
     )
 
 
@@ -937,7 +936,7 @@ async def send_locked(update: Update) -> None:
     await update.effective_chat.send_message(
         locked_text(),
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=rkb_unlock_with_appeal(),
+        reply_markup=rkb_unlock(),
     )
 
 
@@ -1057,7 +1056,7 @@ async def _require_unlock(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: i
         await update.effective_chat.send_message(
             locked_text(),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rkb_unlock_with_appeal(),
+            reply_markup=rkb_unlock(),
         )
         return False
     # No PIN set — safe to open session
@@ -1394,6 +1393,33 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             ctx.user_data.clear()
             db_record_unlock(uid)
             audit(uid, "unlock")
+
+            # ── Cancel any pending reset request — user remembered their PIN ──
+            existing_req = db_get_reset_request_by_uid(uid)
+            if existing_req:
+                req_id = existing_req["request_id"]
+                db_delete_reset_request(req_id)
+                audit(uid, "reset_cancelled_by_unlock")
+                # Stop the reminder loop for this request if running
+                task = _reset_reminder_tasks.pop(req_id, None)
+                if task and not task.done():
+                    task.cancel()
+                _reset_admin_msg_ids.pop(req_id, None)
+                # Inform the admin the user self-resolved
+                try:
+                    await ctx.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=(
+                            f"ℹ️ *Reset request cancelled*\n\n"
+                            f"User `{uid}` successfully unlocked their vault with their passcode "
+                            f"and no longer needs a reset. The pending request has been removed."
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except TelegramError:
+                    pass
+                log.info("Pending reset request cancelled — uid=%s self-unlocked", uid)
+
             await update.effective_chat.send_message(
                 "✅ *Vault unlocked!*\n\n" + home_text(uid, update.effective_user.first_name),
                 parse_mode=ParseMode.MARKDOWN,
@@ -1417,7 +1443,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.effective_chat.send_message(
                     f"❌ *Wrong passcode.* {5 - attempts} attempt{'s' if 5-attempts!=1 else ''} left.",
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=rkb_unlock_with_appeal(),
+                    reply_markup=rkb_unlock(),
                 )
         return
 
@@ -1437,7 +1463,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(
                 locked_text(),
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=rkb_unlock_with_appeal(),
+                reply_markup=rkb_unlock(),
             )
             return
         else:
@@ -1869,7 +1895,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 except (BadRequest, TelegramError):
                     pass
                 await q.message.reply_text(locked_text(), parse_mode=ParseMode.MARKDOWN,
-                                            reply_markup=rkb_unlock_with_appeal())
+                                            reply_markup=rkb_unlock())
                 return
         else:
             session_touch(uid)
@@ -2715,7 +2741,7 @@ async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: 
             "Please wait for the admin to review it.\n\n"
             "If you remember your passcode, tap *🔓 Unlock Vault*.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rkb_unlock_with_appeal(),
+            reply_markup=rkb_unlock(),
         )
         return
 
@@ -2732,7 +2758,7 @@ async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: 
         "Once approved you will receive further instructions here.\n\n"
         "_You can still try to unlock with your passcode while waiting._",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=rkb_unlock_with_appeal(),
+        reply_markup=rkb_unlock(),
     )
 
     # Notify the admin
@@ -2826,7 +2852,7 @@ async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: 
         log.error("Could not notify admin of reset request uid=%s: %s", uid, e)
         await update.effective_chat.send_message(
             "⚠️ Could not reach the admin right now. Please try again later.",
-            reply_markup=rkb_unlock_with_appeal(),
+            reply_markup=rkb_unlock(),
         )
         db_delete_reset_request(request_id)
 
@@ -3011,7 +3037,7 @@ async def _do_temp_pin_unlock(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await update.effective_chat.send_message(
             "❌ *Wrong temporary passcode.*\n\nPlease check the code sent to you and try again.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rkb_unlock_with_appeal(),
+            reply_markup=rkb_unlock(),
         )
 
 
@@ -3148,11 +3174,10 @@ async def watchdog(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                             "• Prevents unauthorised access in shared environments\n"
                             "• Ensures only you can view your 2FA codes\n\n"
                             "Tap *🔓 Unlock Vault* below to re-enter your passcode "
-                            "and regain access.\n\n"
-                            "_Forgot your passcode? Tap_ *🆘 Forgot Passcode? Appeal Reset*_._"
+                            "and regain access."
                         ),
                         parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=rkb_unlock_with_appeal(),
+                        reply_markup=rkb_unlock(),
                     )
                     log.info("Watchdog: sent lock notification to uid=%s", uid)
                 except TelegramError as te:
