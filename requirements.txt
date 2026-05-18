@@ -1,0 +1,11 @@
+# NexAuth — Telegram TOTP Authenticator Bot
+# Install: pip install -r requirements.txt
+# No system libraries needed — all pure Python wheels.
+
+python-telegram-bot[job-queue]==21.6
+pyotp==2.9.0
+cryptography==43.0.1
+pymongo==4.8.0
+python-dotenv==1.0.1
+Pillow==10.4.0
+zxing-cpp==2.2.0
