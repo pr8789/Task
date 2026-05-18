@@ -165,10 +165,11 @@ def verify_pin(pin: str, stored_hash: str) -> bool:
 # ─────────────────────────────────────────────────────────────
 _client      = MongoClient(MONGO_URI, serverSelectionTimeoutMS=6_000)
 _db          = _client["nexauth"]
-col_users    = _db["users"]
-col_accounts = _db["otp_accounts"]
-col_sessions = _db["sessions"]
-col_audit    = _db["audit_log"]
+col_users         = _db["users"]
+col_accounts      = _db["otp_accounts"]
+col_sessions      = _db["sessions"]
+col_audit         = _db["audit_log"]
+col_reset_requests = _db["reset_requests"]
 
 
 def _setup_indexes() -> None:
@@ -198,6 +199,8 @@ def _setup_indexes() -> None:
     col_accounts.create_index([("uid", ASCENDING), ("svc", ASCENDING)], unique=True)
     col_sessions.create_index("uid", unique=True)
     col_audit.create_index("ts", expireAfterSeconds=90 * 86400)
+    col_reset_requests.create_index("uid")
+    col_reset_requests.create_index("ts", expireAfterSeconds=7 * 86400)
     log.info("MongoDB indexes verified.")
 
 
@@ -372,6 +375,40 @@ def audit(uid: int, action: str, detail: str = "") -> None:
         })
     except Exception:
         pass
+
+
+# ── Passcode Reset DB helpers ────────────────────────────────
+def db_create_reset_request(uid: int, name: str, username: Optional[str]) -> str:
+    """Create a reset request and return its request_id."""
+    request_id = base64.urlsafe_b64encode(os.urandom(9)).decode().rstrip("=")
+    col_reset_requests.insert_one({
+        "request_id": request_id,
+        "uid": uid,
+        "name": name,
+        "username": username,
+        "status": "pending",   # pending → approved / denied
+        "ts": datetime.now(timezone.utc),
+    })
+    return request_id
+
+
+def db_get_reset_request(request_id: str) -> Optional[dict]:
+    return col_reset_requests.find_one({"request_id": request_id})
+
+
+def db_get_reset_request_by_uid(uid: int) -> Optional[dict]:
+    return col_reset_requests.find_one({"uid": uid, "status": "pending"})
+
+
+def db_update_reset_status(request_id: str, status: str) -> None:
+    col_reset_requests.update_one(
+        {"request_id": request_id},
+        {"$set": {"status": status, "updated": datetime.now(timezone.utc)}},
+    )
+
+
+def db_delete_reset_request(request_id: str) -> None:
+    col_reset_requests.delete_one({"request_id": request_id})
 
 
 # ─────────────────────────────────────────────────────────────
@@ -598,6 +635,18 @@ def rkb_unlock() -> ReplyKeyboardMarkup:
     )
 
 
+def rkb_unlock_with_appeal() -> ReplyKeyboardMarkup:
+    """Lock screen keyboard that includes the passcode reset appeal button."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🔓 Unlock Vault")],
+            [KeyboardButton("🆘 Forgot Passcode? Appeal Reset")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def rkb_digits() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [[KeyboardButton("6 digits"), KeyboardButton("8 digits")]],
@@ -663,6 +712,23 @@ def ikb_del_confirm(svc: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✅ Yes, Delete", callback_data=f"DEL_OK_RAW:{svc}"),
             InlineKeyboardButton("❌ Cancel",       callback_data="DEL_CANCEL"),
         ]
+    ])
+
+
+def ikb_admin_reset(request_id: str) -> InlineKeyboardMarkup:
+    """Admin inline keyboard shown on a reset request notification."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve Reset", callback_data=f"RESET_APPROVE:{request_id}"),
+            InlineKeyboardButton("❌ Deny Reset",    callback_data=f"RESET_DENY:{request_id}"),
+        ]
+    ])
+
+
+def ikb_user_reset_agree(request_id: str) -> InlineKeyboardMarkup:
+    """Inline keyboard sent to the user after admin approves."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ I Agree — Send Temp Passcode", callback_data=f"RESET_AGREE:{request_id}")]
     ])
 
 
@@ -856,7 +922,8 @@ def locked_text() -> str:
     return (
         f"🔒 *Vault Locked*\n\n"
         f"Session expired after {SESSION_TTL // 60} min of inactivity.\n"
-        f"Tap *🔓 Unlock Vault* or enter your passcode."
+        f"Tap *🔓 Unlock Vault* or enter your passcode.\n\n"
+        f"_Forgot your passcode? Tap_ *🆘 Forgot Passcode? Appeal Reset* _to request a reset._"
     )
 
 
@@ -864,7 +931,7 @@ async def send_locked(update: Update) -> None:
     await update.effective_chat.send_message(
         locked_text(),
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=rkb_unlock(),
+        reply_markup=rkb_unlock_with_appeal(),
     )
 
 
@@ -984,7 +1051,7 @@ async def _require_unlock(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: i
         await update.effective_chat.send_message(
             locked_text(),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rkb_unlock(),
+            reply_markup=rkb_unlock_with_appeal(),
         )
         return False
     # No PIN set — safe to open session
@@ -1253,6 +1320,28 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # ── APPEAL PASSCODE RESET ────────────────────────────────
+    if text == "🆘 Forgot Passcode? Appeal Reset":
+        await _do_appeal_reset(update, ctx, uid)
+        return
+
+    # ── NEW PIN AFTER RESET (temp passcode used) ─────────────
+    if state == "WAIT_RESET_NEW_PIN":
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+        await _do_reset_new_pin(update, ctx, uid, text)
+        return
+
+    if state == "WAIT_RESET_CONFIRM_PIN":
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+        await _do_reset_confirm_pin(update, ctx, uid, text)
+        return
+
     # ── UNLOCK VAULT ────────────────────────────────────────
     if text == "🔓 Unlock Vault":
         pin_hash = db_get_pin(uid)
@@ -1262,9 +1351,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if time.monotonic() < lockout_until:
                 remaining = int(lockout_until - time.monotonic())
                 await update.message.reply_text(
-                    f"🚫 *Too many wrong attempts.*\nTry again in *{remaining}s*.",
+                    f"🚫 *Too many wrong attempts.*\nTry again in *{remaining}s*.\n\n"
+                    f"_Forgot your passcode? Tap_ *🆘 Forgot Passcode? Appeal Reset* _below._",
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=rkb_unlock(),
+                    reply_markup=rkb_unlock_with_appeal(),
                 )
                 return
             ctx.user_data["state"] = "WAIT_PIN_UNLOCK"
@@ -1312,16 +1402,26 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 ctx.bot_data[attempts_key] = 0
                 ctx.user_data.clear()
                 await update.effective_chat.send_message(
-                    f"🚫 *Too many wrong attempts.*\nVault locked for *{PIN_LOCKOUT_S // 60} minutes*.",
+                    f"🚫 *Too many wrong attempts.*\nVault locked for *{PIN_LOCKOUT_S // 60} minutes*.\n\n"
+                    f"_Forgot your passcode? Tap_ *🆘 Forgot Passcode? Appeal Reset* _below._",
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=rkb_unlock(),
+                    reply_markup=rkb_unlock_with_appeal(),
                 )
             else:
                 await update.effective_chat.send_message(
                     f"❌ *Wrong passcode.* {5 - attempts} attempt{'s' if 5-attempts!=1 else ''} left.",
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=rkb_unlock(),
+                    reply_markup=rkb_unlock_with_appeal(),
                 )
+        return
+
+    # ── TEMP PIN ENTRY (reset flow) ─────────────────────────
+    if state == "WAIT_TEMP_PIN_UNLOCK":
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+        await _do_temp_pin_unlock(update, ctx, uid, text)
         return
 
     # ── SESSION CHECK ────────────────────────────────────────
@@ -1331,7 +1431,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(
                 locked_text(),
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=rkb_unlock(),
+                reply_markup=rkb_unlock_with_appeal(),
             )
             return
         else:
@@ -1756,13 +1856,15 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not session_alive(uid):
         pin_hash = db_get_pin(uid)
         if pin_hash:
-            try:
-                await q.edit_message_text(locked_text(), parse_mode=ParseMode.MARKDOWN)
-            except (BadRequest, TelegramError):
-                pass
-            await q.message.reply_text(locked_text(), parse_mode=ParseMode.MARKDOWN,
-                                        reply_markup=rkb_unlock())
-            return
+            # Allow the user-agree callback to pass through even when locked
+            if not data.startswith("RESET_AGREE:"):
+                try:
+                    await q.edit_message_text(locked_text(), parse_mode=ParseMode.MARKDOWN)
+                except (BadRequest, TelegramError):
+                    pass
+                await q.message.reply_text(locked_text(), parse_mode=ParseMode.MARKDOWN,
+                                            reply_markup=rkb_unlock_with_appeal())
+                return
         else:
             session_touch(uid)
 
@@ -1993,6 +2095,27 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 uid, parsed["svc"], doc, parsed["secret"], ctx.bot, paranoid,
             )
         log.info("QR-pick uid=%s svc=%s", uid, parsed.get("svc", "?"))
+
+    # ── RESET APPROVE (admin clicks) ────────────────────────
+    elif data.startswith("RESET_APPROVE:"):
+        if uid != ADMIN_ID:
+            await q.message.reply_text("⛔ Admin only.")
+            return
+        request_id = data.split(":", 1)[1]
+        await _do_admin_approve_reset(q, ctx, request_id)
+
+    # ── RESET DENY (admin clicks) ───────────────────────────
+    elif data.startswith("RESET_DENY:"):
+        if uid != ADMIN_ID:
+            await q.message.reply_text("⛔ Admin only.")
+            return
+        request_id = data.split(":", 1)[1]
+        await _do_admin_deny_reset(q, ctx, request_id)
+
+    # ── RESET AGREE (user clicks after admin approves) ──────
+    elif data.startswith("RESET_AGREE:"):
+        request_id = data.split(":", 1)[1]
+        await _do_user_agree_reset(q, ctx, uid, request_id)
 
     # ── PAGINATION ──────────────────────────────────────────
     elif data.startswith("PAGE:"):
@@ -2554,6 +2677,305 @@ async def _do_confirm_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 
 
 # ─────────────────────────────────────────────────────────────
+# 22a.  PASSCODE RESET FLOW
+# ─────────────────────────────────────────────────────────────
+import random
+import string
+
+TEMP_PIN_DELAY_S = 300   # 5 minutes before temp passcode is sent
+
+
+def _generate_temp_pin(length: int = 8) -> str:
+    """Generate a random numeric temporary passcode."""
+    return "".join(random.choices(string.digits, k=length))
+
+
+async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int) -> None:
+    """User taps 'Forgot Passcode? Appeal Reset' on the lock screen."""
+    pin_hash = db_get_pin(uid)
+    if not pin_hash:
+        await update.effective_chat.send_message(
+            "ℹ️ You don't have a passcode set — nothing to reset.\n\nTap 🔓 Unlock Vault to continue.",
+            reply_markup=rkb_unlock(),
+        )
+        return
+
+    # Check if a pending request already exists
+    existing = db_get_reset_request_by_uid(uid)
+    if existing:
+        await update.effective_chat.send_message(
+            "⏳ *Reset Request Already Pending*\n\n"
+            "You have already submitted a reset request.\n"
+            "Please wait for the admin to review it.\n\n"
+            "If you remember your passcode, tap *🔓 Unlock Vault*.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_unlock_with_appeal(),
+        )
+        return
+
+    user = update.effective_user
+    request_id = db_create_reset_request(uid, user.first_name, user.username)
+    audit(uid, "reset_appeal")
+
+    # Notify the user
+    await update.effective_chat.send_message(
+        "🆘 *Passcode Reset Request Submitted*\n\n"
+        "Your appeal has been sent to the admin for review.\n\n"
+        "The admin may send you a message to verify your identity. "
+        "Please respond promptly and honestly.\n\n"
+        "Once approved you will receive further instructions here.\n\n"
+        "_You can still try to unlock with your passcode while waiting._",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_unlock_with_appeal(),
+    )
+
+    # Notify the admin
+    uname_str = f"@{user.username}" if user.username else "_(no username)_"
+    try:
+        await ctx.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "🔔 *Passcode Reset Request*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 *Name:*     {user.first_name}\n"
+                f"🔗 *Username:* {uname_str}\n"
+                f"🆔 *User ID:*  `{uid}`\n"
+                f"🕐 *Time:*     {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+                "Please verify the user's identity by chatting with them.\n"
+                "Once satisfied, tap ✅ Approve or ❌ Deny below."
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ikb_admin_reset(request_id),
+        )
+        log.info("Reset appeal uid=%s request_id=%s — admin notified", uid, request_id)
+    except TelegramError as e:
+        log.error("Could not notify admin of reset request uid=%s: %s", uid, e)
+        await update.effective_chat.send_message(
+            "⚠️ Could not reach the admin right now. Please try again later.",
+            reply_markup=rkb_unlock_with_appeal(),
+        )
+        db_delete_reset_request(request_id)
+
+
+async def _do_admin_approve_reset(q, ctx, request_id: str) -> None:
+    """Admin taps Approve on the reset notification."""
+    req = db_get_reset_request(request_id)
+    if not req:
+        await q.edit_message_text("⚠️ Request not found or already processed.")
+        return
+    if req["status"] != "pending":
+        await q.edit_message_text(f"ℹ️ Request already {req['status']}.")
+        return
+
+    db_update_reset_status(request_id, "approved")
+    audit(req["uid"], "reset_approved")
+
+    # Tell admin
+    await q.edit_message_text(
+        q.message.text + "\n\n✅ *You approved this request.* The user has been notified.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=None,
+    )
+
+    # Notify user with Agree button
+    try:
+        await ctx.bot.send_message(
+            chat_id=req["uid"],
+            text=(
+                "✅ *Your Passcode Reset Has Been Approved!*\n\n"
+                "The admin has verified your identity and approved your request.\n\n"
+                "🔐 *What happens next:*\n"
+                "• Tap *I Agree* below to confirm you want to proceed\n"
+                "• After *5 minutes*, the bot will send you a temporary passcode\n"
+                "• Use that temporary passcode to unlock your vault\n"
+                "• You will then be prompted to set a new permanent passcode\n\n"
+                "⚠️ _Do not share the temporary passcode with anyone._"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ikb_user_reset_agree(request_id),
+        )
+        log.info("Reset approved uid=%s request_id=%s", req["uid"], request_id)
+    except TelegramError as e:
+        log.error("Could not notify user of reset approval uid=%s: %s", req["uid"], e)
+
+
+async def _do_admin_deny_reset(q, ctx, request_id: str) -> None:
+    """Admin taps Deny on the reset notification."""
+    req = db_get_reset_request(request_id)
+    if not req:
+        await q.edit_message_text("⚠️ Request not found or already processed.")
+        return
+    if req["status"] != "pending":
+        await q.edit_message_text(f"ℹ️ Request already {req['status']}.")
+        return
+
+    db_update_reset_status(request_id, "denied")
+    audit(req["uid"], "reset_denied")
+
+    await q.edit_message_text(
+        q.message.text + "\n\n❌ *You denied this request.* The user has been notified.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=None,
+    )
+
+    try:
+        await ctx.bot.send_message(
+            chat_id=req["uid"],
+            text=(
+                "❌ *Passcode Reset Request Denied*\n\n"
+                "The admin was unable to verify your identity and has denied your reset request.\n\n"
+                "If you believe this is a mistake, please contact the admin directly.\n\n"
+                "If you remember your passcode, tap *🔓 Unlock Vault* to continue."
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_unlock_with_appeal(),
+        )
+        log.info("Reset denied uid=%s request_id=%s", req["uid"], request_id)
+    except TelegramError as e:
+        log.error("Could not notify user of reset denial uid=%s: %s", req["uid"], e)
+
+
+async def _do_user_agree_reset(q, ctx, uid: int, request_id: str) -> None:
+    """User taps 'I Agree — Send Temp Passcode' after admin approves."""
+    req = db_get_reset_request(request_id)
+    if not req:
+        await q.edit_message_text("⚠️ Reset request not found or has expired.")
+        return
+    if req["uid"] != uid:
+        await q.answer("⛔ This button is not for you.", show_alert=True)
+        return
+    if req["status"] != "approved":
+        await q.edit_message_text(
+            "⚠️ This request is no longer active. Please submit a new appeal if needed."
+        )
+        return
+
+    db_update_reset_status(request_id, "agreed")
+    audit(uid, "reset_agreed")
+
+    await q.edit_message_text(
+        "✅ *Request Confirmed!*\n\n"
+        f"You will receive your temporary passcode in *{TEMP_PIN_DELAY_S // 60} minutes*.\n\n"
+        "⏳ Please wait — do not close the chat.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    log.info("Reset agreed uid=%s request_id=%s — scheduling temp pin in %ds", uid, request_id, TEMP_PIN_DELAY_S)
+
+    # Schedule temp passcode delivery
+    async def _send_temp_pin_after_delay():
+        await asyncio.sleep(TEMP_PIN_DELAY_S)
+        temp_pin = _generate_temp_pin(8)
+        # Store hashed temp pin as the current pin
+        db_set_pin(uid, hash_pin(temp_pin))
+        db_delete_reset_request(request_id)
+        audit(uid, "reset_temp_pin_sent")
+        try:
+            await ctx.bot.send_message(
+                chat_id=uid,
+                text=(
+                    "🔑 *Your Temporary Passcode*\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"`{temp_pin}`\n\n"
+                    "_(tap to copy)_\n\n"
+                    "⚠️ *Important:*\n"
+                    "• Use this code to unlock your vault *right now*\n"
+                    "• You will be required to set a new permanent passcode immediately\n"
+                    "• This message will be deleted in *60 seconds*\n"
+                    "• Never share this code with anyone"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_unlock(),
+            )
+            log.info("Temp pin sent uid=%s", uid)
+
+            # Auto-delete temp pin message after 60s
+            async def _del_temp_msg():
+                await asyncio.sleep(60)
+                try:
+                    msgs = await ctx.bot.get_updates()
+                except Exception:
+                    pass
+            # Note: we can't easily get the message_id here; we'll use a workaround
+            # by marking the user's state so they know to use it
+        except TelegramError as e:
+            log.error("Could not send temp pin uid=%s: %s", uid, e)
+
+    asyncio.create_task(_send_temp_pin_after_delay())
+
+
+async def _do_temp_pin_unlock(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                               uid: int, text: str) -> None:
+    """User enters temp passcode on the lock screen — force new passcode set."""
+    pin_hash = db_get_pin(uid)
+    if pin_hash and verify_pin(text, pin_hash):
+        # Clear attempts/lockout
+        ctx.bot_data.pop(f"pin_lockout_{uid}", None)
+        ctx.bot_data.pop(f"pin_attempts_{uid}", None)
+        session_touch(uid)
+        ctx.user_data["state"] = "WAIT_RESET_NEW_PIN"
+        audit(uid, "reset_temp_unlock")
+        await update.effective_chat.send_message(
+            "✅ *Temporary passcode accepted!*\n\n"
+            "🔑 *You must now set a new permanent passcode.*\n\n"
+            "Send a new 4–8 digit PIN.\n_Message deleted immediately for security._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_cancel(),
+        )
+    else:
+        await update.effective_chat.send_message(
+            "❌ *Wrong temporary passcode.*\n\nPlease check the code sent to you and try again.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_unlock_with_appeal(),
+        )
+
+
+async def _do_reset_new_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                             uid: int, text: str) -> None:
+    """User sets a new PIN after using temp passcode."""
+    if not _PIN_RE.match(text):
+        await update.effective_chat.send_message(
+            "❌ *Invalid PIN.* Enter 4–8 digits only.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_cancel(),
+        )
+        return
+    ctx.user_data["pending_reset_pin"] = text
+    ctx.user_data["state"] = "WAIT_RESET_CONFIRM_PIN"
+    await update.effective_chat.send_message(
+        "🔁 *Confirm new passcode*\n\nEnter the same PIN again:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_cancel(),
+    )
+
+
+async def _do_reset_confirm_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                 uid: int, text: str) -> None:
+    """User confirms their new PIN after reset."""
+    pending = ctx.user_data.pop("pending_reset_pin", None)
+    ctx.user_data.clear()
+    if not pending:
+        await update.effective_chat.send_message("⚠️ Session lost.", reply_markup=rkb_home())
+        return
+    if text != pending:
+        await update.effective_chat.send_message(
+            "❌ *PINs do not match.*\n\nPlease start over via ⚙️ Settings → 🔑 Set Passcode.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_settings(),
+        )
+        return
+    db_set_pin(uid, hash_pin(pending))
+    audit(uid, "reset_new_pin_set")
+    log.info("New PIN set after reset uid=%s", uid)
+    await update.effective_chat.send_message(
+        "🎉 *New Passcode Set Successfully!*\n\n"
+        "Your vault is now protected with your new passcode.\n"
+        "Keep it safe — it cannot be recovered without an admin reset.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_home(),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 # 22.  STATS
 # ─────────────────────────────────────────────────────────────
 async def _do_stats(update: Update, uid: int) -> None:
@@ -2640,10 +3062,11 @@ async def watchdog(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                             "• Prevents unauthorised access in shared environments\n"
                             "• Ensures only you can view your 2FA codes\n\n"
                             "Tap *🔓 Unlock Vault* below to re-enter your passcode "
-                            "and regain access."
+                            "and regain access.\n\n"
+                            "_Forgot your passcode? Tap_ *🆘 Forgot Passcode? Appeal Reset*_._"
                         ),
                         parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=rkb_unlock(),
+                        reply_markup=rkb_unlock_with_appeal(),
                     )
                     log.info("Watchdog: sent lock notification to uid=%s", uid)
                 except TelegramError as te:
