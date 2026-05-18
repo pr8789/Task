@@ -416,6 +416,12 @@ def db_delete_reset_request(request_id: str) -> None:
 # ─────────────────────────────────────────────────────────────
 _session_cache: dict = {}
 
+# Tracks active admin-reminder tasks for reset requests: request_id → asyncio.Task
+_reset_reminder_tasks: dict[str, asyncio.Task] = {}
+
+# Tracks the current admin notification message_id for each request: request_id → int
+_reset_admin_msg_ids: dict[str, int] = {}
+
 
 def session_touch(uid: int) -> None:
     _session_cache[uid] = time.monotonic()
@@ -2732,7 +2738,7 @@ async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: 
     # Notify the admin
     uname_str = f"@{user.username}" if user.username else "_(no username)_"
     try:
-        await ctx.bot.send_message(
+        admin_msg = await ctx.bot.send_message(
             chat_id=ADMIN_ID,
             text=(
                 "🔔 *Passcode Reset Request*\n"
@@ -2747,7 +2753,75 @@ async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: 
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=ikb_admin_reset(request_id),
         )
+        _reset_admin_msg_ids[request_id] = admin_msg.message_id
         log.info("Reset appeal uid=%s request_id=%s — admin notified", uid, request_id)
+
+        # ── Auto-reminder: if admin doesn't react within 30s, resend & delete old ──
+        async def _admin_reminder_loop(req_id: str, first_msg_id: int,
+                                       u_first_name: str, u_username: str,
+                                       u_uid: int) -> None:
+            """
+            Repeatedly reminds the admin every 30 s as long as the request
+            stays 'pending'. Each cycle:
+              1. Wait 30 s.
+              2. Re-check DB — if no longer pending, stop.
+              3. Send a fresh notification (capturing the new message_id).
+              4. After another 10 s delete the old message (40 s total age).
+            """
+            old_msg_id = first_msg_id
+            uname_display = f"@{u_username}" if u_username else "_(no username)_"
+            attempt = 1
+            while True:
+                await asyncio.sleep(30)
+
+                req_check = db_get_reset_request(req_id)
+                if not req_check or req_check.get("status") != "pending":
+                    # Admin already acted — clean up and exit
+                    _reset_reminder_tasks.pop(req_id, None)
+                    _reset_admin_msg_ids.pop(req_id, None)
+                    return
+
+                attempt += 1
+                try:
+                    new_msg = await ctx.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=(
+                            f"🔔 *Passcode Reset Request* _(reminder #{attempt})_\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"👤 *Name:*     {u_first_name}\n"
+                            f"🔗 *Username:* {uname_display}\n"
+                            f"🆔 *User ID:*  `{u_uid}`\n"
+                            f"🕐 *Time:*     {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+                            "⚠️ _This request is still awaiting your decision._\n"
+                            "Please tap ✅ Approve or ❌ Deny below."
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=ikb_admin_reset(req_id),
+                    )
+                    _reset_admin_msg_ids[req_id] = new_msg.message_id
+                    log.info(
+                        "Reset reminder #%d sent uid=%s request_id=%s",
+                        attempt, u_uid, req_id,
+                    )
+                except TelegramError as te:
+                    log.warning("Could not send reset reminder: %s", te)
+                    _reset_reminder_tasks.pop(req_id, None)
+                    return
+
+                # Delete the OLD message 10 s after the new one arrives (= ~40 s after it was sent)
+                await asyncio.sleep(10)
+                try:
+                    await ctx.bot.delete_message(chat_id=ADMIN_ID, message_id=old_msg_id)
+                except TelegramError:
+                    pass  # already deleted or too old — ignore
+                old_msg_id = new_msg.message_id
+
+        task = asyncio.create_task(
+            _admin_reminder_loop(request_id, admin_msg.message_id,
+                                 user.first_name, user.username, uid)
+        )
+        _reset_reminder_tasks[request_id] = task
+
     except TelegramError as e:
         log.error("Could not notify admin of reset request uid=%s: %s", uid, e)
         await update.effective_chat.send_message(
@@ -2769,6 +2843,12 @@ async def _do_admin_approve_reset(q, ctx, request_id: str) -> None:
 
     db_update_reset_status(request_id, "approved")
     audit(req["uid"], "reset_approved")
+
+    # Stop the auto-reminder loop — admin has acted
+    task = _reset_reminder_tasks.pop(request_id, None)
+    if task and not task.done():
+        task.cancel()
+    _reset_admin_msg_ids.pop(request_id, None)
 
     # Tell admin
     await q.edit_message_text(
@@ -2811,6 +2891,12 @@ async def _do_admin_deny_reset(q, ctx, request_id: str) -> None:
 
     db_update_reset_status(request_id, "denied")
     audit(req["uid"], "reset_denied")
+
+    # Stop the auto-reminder loop — admin has acted
+    task = _reset_reminder_tasks.pop(request_id, None)
+    if task and not task.done():
+        task.cancel()
+    _reset_admin_msg_ids.pop(request_id, None)
 
     await q.edit_message_text(
         q.message.text + "\n\n❌ *You denied this request.* The user has been notified.",
@@ -3089,6 +3175,12 @@ async def watchdog(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         _bulk_refresh_tasks[uid_key] = [t for t in _bulk_refresh_tasks[uid_key] if not t.done()]
         if not _bulk_refresh_tasks[uid_key]:
             _bulk_refresh_tasks.pop(uid_key, None)
+
+    # Clean up finished admin reset-reminder tasks
+    for req_id in list(_reset_reminder_tasks.keys()):
+        if _reset_reminder_tasks[req_id].done():
+            _reset_reminder_tasks.pop(req_id, None)
+            _reset_admin_msg_ids.pop(req_id, None)
 
 
 # ─────────────────────────────────────────────────────────────
