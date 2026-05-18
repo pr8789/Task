@@ -546,12 +546,9 @@ async def spin(msg, label: str, rounds: int = 6) -> None:
 def rkb_home() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("➕ Add Account"),    KeyboardButton("🔑 Get OTP")],
-            [KeyboardButton("📋 My Accounts"),    KeyboardButton("🔍 Search")],
-            [KeyboardButton("🗑 Delete Account"), KeyboardButton("✏️ Rename")],
-            [KeyboardButton("💾 Backup"),          KeyboardButton("📥 Restore")],
-            [KeyboardButton("🔒 Lock Vault"),      KeyboardButton("⚙️ Settings")],
-            [KeyboardButton("📊 My Stats"),        KeyboardButton("❓ Help")],
+            [KeyboardButton("➕ Add Account"),  KeyboardButton("🔑 Get OTP")],
+            [KeyboardButton("📋 My Accounts"),  KeyboardButton("🔍 Search")],
+            [KeyboardButton("🔒 Lock Vault"),   KeyboardButton("⚙️ Settings")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -573,9 +570,11 @@ def rkb_add_menu() -> ReplyKeyboardMarkup:
 def rkb_settings() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
+            [KeyboardButton("🗑 Delete Account"), KeyboardButton("✏️ Rename")],
+            [KeyboardButton("💾 Backup"),          KeyboardButton("📥 Restore")],
             [KeyboardButton("🔑 Set Passcode"),    KeyboardButton("🔓 Remove Passcode")],
-            [KeyboardButton("🔕 Paranoid Mode"),   KeyboardButton("📊 My Stats")],
-            [KeyboardButton("🕐 Session Info"),    KeyboardButton("🔒 Lock Vault")],
+            [KeyboardButton("🔕 Paranoid Mode"),   KeyboardButton("🕐 Session Info")],
+            [KeyboardButton("📊 My Stats"),        KeyboardButton("❓ Help")],
             [KeyboardButton("🏠 Home")],
         ],
         resize_keyboard=True,
@@ -879,18 +878,25 @@ def _ensure_user(update: Update) -> None:
 # 12.  AUTO-REFRESH OTP LOOP
 # ─────────────────────────────────────────────────────────────
 _refresh_tasks: dict[int, asyncio.Task] = {}
+# Bulk tasks spawned by "Get OTP" (all accounts view) — tracked per uid as a list
+_bulk_refresh_tasks: dict[int, list[asyncio.Task]] = {}
 
 
 def _cancel_refresh(uid: int) -> None:
     task = _refresh_tasks.pop(uid, None)
     if task and not task.done():
         task.cancel()
+    # Also cancel any bulk OTP refresh tasks
+    for t in _bulk_refresh_tasks.pop(uid, []):
+        if not t.done():
+            t.cancel()
 
 
 async def _otp_refresh_loop(
     chat_id: int, message_id: int, uid: int,
     svc: str, doc: dict, secret: str, bot,
     paranoid: bool = False,
+    no_inline: bool = False,
 ) -> None:
     digits    = doc.get("digits", 6)
     period    = doc.get("period", 30)
@@ -926,11 +932,12 @@ async def _otp_refresh_loop(
                 break
 
             text = otp_text(svc, issuer, secret, digits, period, algorithm)
+            markup = None if no_inline else ikb_otp_view(svc)
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id, message_id=message_id,
                     text=text, parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=ikb_otp_view(svc),
+                    reply_markup=markup,
                 )
             except BadRequest as e:
                 if "not modified" not in str(e).lower():
@@ -949,10 +956,11 @@ async def _otp_refresh_loop(
 
 async def start_otp_refresh(chat_id: int, message_id: int,
                              uid: int, svc: str, doc: dict, secret: str,
-                             bot, paranoid: bool = False) -> None:
+                             bot, paranoid: bool = False,
+                             no_inline: bool = False) -> None:
     _cancel_refresh(uid)
     task = asyncio.create_task(
-        _otp_refresh_loop(chat_id, message_id, uid, svc, doc, secret, bot, paranoid)
+        _otp_refresh_loop(chat_id, message_id, uid, svc, doc, secret, bot, paranoid, no_inline)
     )
     _refresh_tasks[uid] = task
 
@@ -1330,11 +1338,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             session_touch(uid)
             _KNOWN_BUTTONS = {
                 "➕ Add Account", "🔑 Get OTP", "📋 My Accounts", "🔍 Search",
+                "🔒 Lock Vault", "⚙️ Settings",
+                # Settings panel
                 "🗑 Delete Account", "✏️ Rename", "💾 Backup", "📥 Restore",
-                "🔒 Lock Vault", "⚙️ Settings", "🔑 Set Passcode",
-                "🔓 Remove Passcode", "📊 My Stats", "🏠 Home",
+                "🔑 Set Passcode", "🔓 Remove Passcode",
+                "🔕 Paranoid Mode", "🕐 Session Info",
+                "📊 My Stats", "❓ Help", "🏠 Home",
+                # Add-account sub-menu
                 "📷 Scan QR Code", "🔗 Paste URI", "🔐 Enter Secret Key",
-                "🔕 Paranoid Mode", "❓ Help", "🕐 Session Info",
             }
             if text not in _KNOWN_BUTTONS:
                 await update.message.reply_text(
@@ -1419,11 +1430,52 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 "📭 *No accounts yet.* Add one first.",
                 parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_home())
             return
+        # Cancel any previous single or bulk refresh loops for this user
+        _cancel_refresh(uid)
+        # Sort: starred first, then alphabetical
+        docs_sorted = sorted(docs, key=lambda x: (not x.get("starred", False), x["svc"].lower()))
         await update.message.reply_text(
-            "🔑 *Get OTP Code*\n\nChoose a service:",
+            f"🔑 *Your OTP Codes* — {len(docs_sorted)} account{'s' if len(docs_sorted) != 1 else ''}\n"
+            f"_Tap any code to copy · Codes refresh automatically_",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=ikb_accounts(docs, "OTP_GET", uid=uid),
+            reply_markup=rkb_home(),
         )
+        paranoid = db_get_setting(uid, "paranoid", False)
+        bulk_tasks: list = []
+        for doc in docs_sorted:
+            svc = doc["svc"]
+            full_doc = db_get(uid, svc)
+            if not full_doc:
+                continue
+            try:
+                secret = aes_decrypt(full_doc["enc"])
+            except Exception:
+                await update.effective_chat.send_message(
+                    f"🔐 *{svc}* — decryption failed.", parse_mode=ParseMode.MARKDOWN
+                )
+                continue
+            otp_type = full_doc.get("type", "totp")
+            counter  = full_doc.get("counter", 0)
+            if otp_type == "hotp":
+                counter = db_hotp_increment(uid, svc)
+            otp_msg = await update.effective_chat.send_message(
+                otp_text(svc, full_doc.get("issuer", svc), secret,
+                         full_doc.get("digits", 6), full_doc.get("period", 30),
+                         full_doc.get("algorithm", "SHA1"), otp_type, counter),
+                parse_mode=ParseMode.MARKDOWN,
+                # No inline keyboard — clean tap-to-copy display only
+            )
+            # Spawn individual refresh loop without overwriting _refresh_tasks
+            if otp_type == "totp":
+                task = asyncio.create_task(
+                    _otp_refresh_loop(
+                        otp_msg.chat_id, otp_msg.message_id,
+                        uid, svc, full_doc, secret, ctx.bot, paranoid,
+                        no_inline=True,
+                    )
+                )
+                bulk_tasks.append(task)
+        _bulk_refresh_tasks[uid] = bulk_tasks
 
     elif text == "📋 My Accounts":
         docs = db_list(uid)
@@ -1434,7 +1486,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
         await update.message.reply_text(
             f"📋 *Your Vault* — {len(docs)} account{'s' if len(docs)!=1 else ''}\n"
-            f"_Tap any account to view details._",
+            f"_Tap an account to manage it: get OTP, rename, delete, export & more._",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=ikb_accounts(docs, "DETAIL", uid=uid),
         )
@@ -2609,6 +2661,11 @@ async def watchdog(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         keys = list(_pending_qr.keys())[:50]
         for k in keys:
             _pending_qr.pop(k, None)
+    # Clean up finished bulk refresh task lists
+    for uid_key in list(_bulk_refresh_tasks.keys()):
+        _bulk_refresh_tasks[uid_key] = [t for t in _bulk_refresh_tasks[uid_key] if not t.done()]
+        if not _bulk_refresh_tasks[uid_key]:
+            _bulk_refresh_tasks.pop(uid_key, None)
 
 
 # ─────────────────────────────────────────────────────────────
