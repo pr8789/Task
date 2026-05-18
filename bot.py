@@ -1297,6 +1297,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ── CANCEL ──────────────────────────────────────────────
     if text == "❌ Cancel":
+        # Block Cancel if user is in the forced new-passcode flow
+        if state in ("WAIT_RESET_NEW_PIN", "WAIT_RESET_CONFIRM_PIN"):
+            await update.message.reply_text(
+                "⚠️ *You must set a new passcode before continuing.*\n\n"
+                "Send a new 4–8 digit PIN to proceed.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_cancel(),
+            )
+            return
+
         ctx.user_data.clear()
         _cancel_refresh(uid)
 
@@ -1390,9 +1400,26 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             ctx.bot_data.pop(f"pin_lockout_{uid}", None)
             ctx.bot_data.pop(f"pin_attempts_{uid}", None)
             session_touch(uid)
-            ctx.user_data.clear()
             db_record_unlock(uid)
             audit(uid, "unlock")
+
+            # ── Check if this was a temp-pin login — force passcode change ──
+            temp_pending = db_get_setting(uid, "temp_pin_pending", False)
+            if temp_pending:
+                db_set_setting(uid, "temp_pin_pending", False)
+                ctx.user_data.clear()
+                ctx.user_data["state"] = "WAIT_RESET_NEW_PIN"
+                audit(uid, "reset_temp_unlock")
+                await update.effective_chat.send_message(
+                    "✅ *Temporary passcode accepted!*\n\n"
+                    "🔑 *You must now set a new permanent passcode.*\n\n"
+                    "Send a new 4–8 digit PIN.\n_Message deleted immediately for security._",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=rkb_cancel(),
+                )
+                return
+
+            ctx.user_data.clear()
 
             # ── Cancel any pending reset request — user remembered their PIN ──
             existing_req = db_get_reset_request_by_uid(uid)
@@ -1488,6 +1515,24 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 return
 
     session_touch(uid)
+
+    # ── BLOCK ALL ACTIONS UNTIL FORCED PASSCODE CHANGE IS DONE ──
+    if state in ("WAIT_RESET_NEW_PIN", "WAIT_RESET_CONFIRM_PIN"):
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+        prompt = (
+            "🔁 *Confirm new passcode*\n\nEnter the same PIN again:"
+            if state == "WAIT_RESET_CONFIRM_PIN"
+            else "🔑 *Set new passcode*\n\nSend a new 4–8 digit PIN.\n_Message deleted immediately for security._"
+        )
+        await update.effective_chat.send_message(
+            "⚠️ *You must set a new passcode before you can use the vault.*\n\n" + prompt,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_cancel(),
+        )
+        return
 
     # ── WAIT-STATE FLOWS ────────────────────────────────────
     if state == "WAIT_RESTORE":
@@ -2982,7 +3027,7 @@ async def _do_user_agree_reset(q, ctx, uid: int, request_id: str) -> None:
         db_delete_reset_request(request_id)
         audit(uid, "reset_temp_pin_sent")
         try:
-            await ctx.bot.send_message(
+            temp_msg = await ctx.bot.send_message(
                 chat_id=uid,
                 text=(
                     "🔑 *Your Temporary Passcode*\n"
@@ -3001,14 +3046,18 @@ async def _do_user_agree_reset(q, ctx, uid: int, request_id: str) -> None:
             log.info("Temp pin sent uid=%s", uid)
 
             # Auto-delete temp pin message after 60s
-            async def _del_temp_msg():
+            async def _del_temp_msg(m):
                 await asyncio.sleep(60)
                 try:
-                    msgs = await ctx.bot.get_updates()
-                except Exception:
+                    await m.delete()
+                except TelegramError:
                     pass
-            # Note: we can't easily get the message_id here; we'll use a workaround
-            # by marking the user's state so they know to use it
+
+            asyncio.create_task(_del_temp_msg(temp_msg))
+
+            # Mark user state so the next unlock attempt goes through the forced-change flow
+            # We store a flag in MongoDB so it survives across handler boundaries
+            db_set_setting(uid, "temp_pin_pending", True)
         except TelegramError as e:
             log.error("Could not send temp pin uid=%s: %s", uid, e)
 
