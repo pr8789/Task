@@ -682,8 +682,8 @@ def rkb_add_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("📷 Scan QR Code")],
-            [KeyboardButton("🔗 Paste URI"),     KeyboardButton("🔐 Enter Secret Key")],
-            [KeyboardButton("🏠 Home")],
+            [KeyboardButton("🔗 Paste URI"), KeyboardButton("🔐 Enter Secret Key")],
+            [KeyboardButton("🔙 Back")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -698,35 +698,84 @@ def rkb_settings() -> ReplyKeyboardMarkup:
             [KeyboardButton("🔑 Set Passcode"),    KeyboardButton("🔓 Remove Passcode")],
             [KeyboardButton("🔕 Paranoid Mode"),   KeyboardButton("🕐 Session Info")],
             [KeyboardButton("📊 My Stats"),        KeyboardButton("❓ Help")],
-            [KeyboardButton("🏠 Home")],
+            [KeyboardButton("🔙 Back")],
         ],
         resize_keyboard=True,
         is_persistent=True,
     )
 
 
-def rkb_cancel() -> ReplyKeyboardMarkup:
-    """Cancel + Home — used for flows entered from the home screen."""
+def rkb_back_home() -> ReplyKeyboardMarkup:
+    """Single back button that returns to Home. Used on screens launched from Home."""
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("❌ Cancel")], [KeyboardButton("🏠 Home")]],
+        [[KeyboardButton("🔙 Back")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def rkb_back_settings() -> ReplyKeyboardMarkup:
+    """Single back button that returns to Settings."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("🔙 Back")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def rkb_back_add() -> ReplyKeyboardMarkup:
+    """Single back button that returns to Add Account menu."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("🔙 Back")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def rkb_cancel() -> ReplyKeyboardMarkup:
+    """❌ Cancel + 🔙 Back — used in input-wait states from Home."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("❌ Cancel"), KeyboardButton("🔙 Back")]],
         resize_keyboard=True,
         is_persistent=True,
     )
 
 
 def rkb_cancel_settings() -> ReplyKeyboardMarkup:
-    """Cancel + Back to Settings — used for flows entered from the settings screen."""
+    """❌ Cancel + 🔙 Back — used in input-wait states from Settings."""
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("❌ Cancel")], [KeyboardButton("🔙 Back to Settings")]],
+        [[KeyboardButton("❌ Cancel"), KeyboardButton("🔙 Back")]],
         resize_keyboard=True,
         is_persistent=True,
     )
 
 
 def rkb_cancel_add() -> ReplyKeyboardMarkup:
-    """Cancel + Back to Add menu — used inside the add-account flow."""
+    """❌ Cancel + 🔙 Back — used in input-wait states from Add Account."""
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("❌ Cancel")], [KeyboardButton("🔙 Back to Add Menu")]],
+        [[KeyboardButton("❌ Cancel"), KeyboardButton("🔙 Back")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def rkb_digits() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("6 digits"), KeyboardButton("8 digits")],
+            [KeyboardButton("🔙 Back")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def rkb_period() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("30 seconds"), KeyboardButton("60 seconds")],
+            [KeyboardButton("🔙 Back")],
+        ],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -752,20 +801,6 @@ def rkb_unlock_with_appeal() -> ReplyKeyboardMarkup:
     )
 
 
-def rkb_digits() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("6 digits"), KeyboardButton("8 digits")]],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
-
-
-def rkb_period() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("30 seconds"), KeyboardButton("60 seconds")]],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1240,7 +1275,12 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "`/digest` — monthly activity summary\n"
     )
     pin_set = bool(db_get_pin(uid))
-    keyboard = rkb_unlock() if (pin_set and not session_alive(uid)) else rkb_home()
+    if pin_set and not session_alive(uid):
+        keyboard = rkb_unlock()
+    elif ctx.user_data.get("back") == "settings":
+        keyboard = rkb_back_settings()
+    else:
+        keyboard = rkb_home()
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 
@@ -1434,7 +1474,59 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # ── APPEAL PASSCODE RESET ────────────────────────────────
+    # ── BACK ────────────────────────────────────────────────
+    if text == "🔙 Back":
+        # Blocked during forced passcode-change flow
+        if state in ("WAIT_RESET_NEW_PIN", "WAIT_RESET_CONFIRM_PIN"):
+            await update.message.reply_text(
+                "⚠️ *You must set a new passcode before continuing.*\n\n"
+                "Send a new 4–8 digit PIN to proceed.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_cancel(),
+            )
+            return
+
+        back_dest = ctx.user_data.get("back", "home")
+        ctx.user_data.clear()
+        _cancel_refresh(uid)
+
+        # Security: if vault is locked, back must go to lock screen
+        if not session_alive(uid):
+            pin_hash = db_get_pin(uid)
+            if pin_hash:
+                await update.message.reply_text(
+                    locked_text(), parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_unlock()
+                )
+                return
+            else:
+                session_touch(uid)
+
+        if back_dest == "settings":
+            pin_set  = bool(db_get_pin(uid))
+            paranoid = db_get_setting(uid, "paranoid", False)
+            await update.message.reply_text(
+                f"⚙️ *Settings*\n\n"
+                f"🔑 Passcode: {'✅ Set' if pin_set else '❌ Not set'}\n"
+                f"🔕 Paranoid mode: {'✅ ON' if paranoid else '❌ OFF'}\n\n"
+                f"Choose an option:",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_settings(),
+            )
+        elif back_dest == "add":
+            await update.message.reply_text(
+                "➕ *Add New TOTP Account*\n\nChoose how to add:",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_add_menu(),
+            )
+        else:  # "home" or anything unrecognised
+            await update.message.reply_text(
+                home_text(uid, update.effective_user.first_name),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_home(),
+            )
+        return
+
+
     if text == "🆘 Forgot Passcode? Appeal Reset":
         await _do_appeal_reset(update, ctx, uid)
         return
@@ -1645,9 +1737,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 "🗑 Delete Account", "✏️ Rename", "💾 Backup", "📥 Restore",
                 "🔑 Set Passcode", "🔓 Remove Passcode",
                 "🔕 Paranoid Mode", "🕐 Session Info",
-                "📊 My Stats", "❓ Help", "🏠 Home",
+                "📊 My Stats", "❓ Help",
                 # Add-account sub-menu
                 "📷 Scan QR Code", "🔗 Paste URI", "🔐 Enter Secret Key",
+                # Navigation
+                "🏠 Home", "🔙 Back", "❌ Cancel",
+                # Step choices
+                "6 digits", "8 digits", "30 seconds", "60 seconds",
             }
             if text not in _KNOWN_BUTTONS:
                 await update.message.reply_text(
@@ -1712,6 +1808,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # ── MAIN MENU BUTTONS ───────────────────────────────────
     if text == "➕ Add Account":
         ctx.user_data.clear()
+        ctx.user_data["back"] = "home"
         _cancel_refresh(uid)
         await update.message.reply_text(
             "➕ *Add New TOTP Account*\n\nChoose how to add:",
@@ -1721,26 +1818,29 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     elif text == "📷 Scan QR Code":
         ctx.user_data["state"] = "WAIT_QR"
+        ctx.user_data["back"] = "add"
         await update.message.reply_text(
             "📷 *Scan QR Code*\n\nSend the QR code image now.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rkb_cancel(),
+            reply_markup=rkb_cancel_add(),
         )
 
     elif text == "🔗 Paste URI":
         ctx.user_data["state"] = "WAIT_URI"
+        ctx.user_data["back"] = "add"
         await update.message.reply_text(
             "🔗 *Paste otpauth URI*\n\nSend your `otpauth://totp/...` string.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rkb_cancel(),
+            reply_markup=rkb_cancel_add(),
         )
 
     elif text == "🔐 Enter Secret Key":
         ctx.user_data["state"] = "WAIT_KEY"
+        ctx.user_data["back"] = "add"
         await update.message.reply_text(
             "🔐 *Enter Secret Key*\n\nSend your base32 secret key.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rkb_cancel(),
+            reply_markup=rkb_cancel_add(),
         )
 
     elif text == "🔑 Get OTP":
@@ -1750,15 +1850,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 "📭 *No accounts yet.* Add one first.",
                 parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_home())
             return
-        # Cancel any previous single or bulk refresh loops for this user
         _cancel_refresh(uid)
-        # Sort: starred first, then alphabetical
         docs_sorted = sorted(docs, key=lambda x: (not x.get("starred", False), x["svc"].lower()))
         await update.message.reply_text(
             f"🔑 *Your OTP Codes* — {len(docs_sorted)} account{'s' if len(docs_sorted) != 1 else ''}\n"
             f"_Tap any code to copy · Codes refresh automatically_",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rkb_home(),
+            reply_markup=rkb_back_home(),
         )
         paranoid = db_get_setting(uid, "paranoid", False)
         bulk_tasks: list = []
@@ -1804,15 +1902,23 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 "📭 *Vault is empty.*",
                 parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_home())
             return
+        ctx.user_data["back"] = "home"
         await update.message.reply_text(
             f"📋 *Your Vault* — {len(docs)} account{'s' if len(docs)!=1 else ''}\n"
             f"_Tap an account to manage it: get OTP, rename, delete, export & more._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_back_home(),
+        )
+        # Send the account list as a follow-up with inline buttons
+        await update.effective_chat.send_message(
+            "👇 Choose an account:",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=ikb_accounts(docs, "DETAIL", uid=uid),
         )
 
     elif text == "🔍 Search":
         ctx.user_data["state"] = "WAIT_SEARCH"
+        ctx.user_data["back"] = "home"
         await update.message.reply_text(
             "🔍 *Search Accounts*\n\nType any part of the name or issuer.",
             parse_mode=ParseMode.MARKDOWN,
@@ -1824,11 +1930,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not docs:
             await update.message.reply_text(
                 "📭 *Nothing to delete.*",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_home())
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_settings())
             return
+        ctx.user_data["back"] = "settings"
         await update.message.reply_text(
             "🗑 *Delete Account*\n\nChoose a service:",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_back_settings(),
+        )
+        await update.effective_chat.send_message(
+            "👇 Choose an account to delete:",
             reply_markup=ikb_accounts(docs, "DEL_ASK", uid=uid),
         )
 
@@ -1837,11 +1948,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not docs:
             await update.message.reply_text(
                 "📭 *No accounts to rename.*",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_home())
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_settings())
             return
+        ctx.user_data["back"] = "settings"
         await update.message.reply_text(
             "✏️ *Rename Account*\n\nChoose a service:",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_back_settings(),
+        )
+        await update.effective_chat.send_message(
+            "👇 Choose an account to rename:",
             reply_markup=ikb_accounts(docs, "RENAME_CB", uid=uid),
         )
 
@@ -1850,10 +1966,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     elif text == "📥 Restore":
         ctx.user_data["state"] = "WAIT_RESTORE"
+        ctx.user_data["back"] = "settings"
         await update.message.reply_text(
             "📥 *Restore Backup*\n\nPaste your encrypted backup string.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rkb_cancel(),
+            reply_markup=rkb_cancel_settings(),
         )
 
     elif text == "🔒 Lock Vault":
@@ -1869,6 +1986,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     elif text == "⚙️ Settings":
         ctx.user_data.clear()
+        ctx.user_data["back"] = "home"
         pin_set  = bool(db_get_pin(uid))
         paranoid = db_get_setting(uid, "paranoid", False)
         await update.message.reply_text(
@@ -1882,10 +2000,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     elif text == "🔑 Set Passcode":
         ctx.user_data["state"] = "WAIT_SET_PIN"
+        ctx.user_data["back"] = "settings"
         await update.message.reply_text(
             "🔑 *Set Passcode*\n\nSend a 4–8 digit PIN.\n_Message deleted immediately for security._",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rkb_cancel(),
+            reply_markup=rkb_cancel_settings(),
         )
 
     elif text == "🔓 Remove Passcode":
@@ -1893,6 +2012,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("ℹ️ No passcode is set.", reply_markup=rkb_settings())
         else:
             db_set_pin(uid, None)
+            db_set_setting(uid, "pin_attempts", 0)
+            db_set_setting(uid, "pin_lockout_until", None)
+            audit(uid, "pin_removed")
             await update.message.reply_text(
                 "✅ *Passcode removed.*",
                 parse_mode=ParseMode.MARKDOWN,
@@ -1912,6 +2034,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     elif text == "📊 My Stats":
+        ctx.user_data["back"] = "settings"
         await _do_stats(update, uid)
 
     elif text == "🏠 Home":
@@ -1924,10 +2047,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     elif text == "❓ Help":
+        ctx.user_data["back"] = "settings"
         await cmd_help(update, ctx)
 
     elif text == "🕐 Session Info":
         session_doc = col_sessions.find_one({"uid": uid})
+        ctx.user_data["back"] = "settings"
         if session_doc:
             last = session_doc.get("last")
             if last and last.tzinfo is None:
@@ -1942,7 +2067,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 f"🔒 Auto-lock after: *{SESSION_TTL // 60} min* of inactivity\n\n"
                 f"_Your vault will lock automatically to protect your OTP secrets._",
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=rkb_settings(),
+                reply_markup=rkb_back_settings(),
             )
         else:
             await update.message.reply_text(
@@ -1954,8 +2079,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         hints = {
             "WAIT_URI":          "📋 Please paste an `otpauth://totp/...` URI.",
             "WAIT_KEY":          "🔐 Please send your base32 secret key.",
-            "WAIT_KEY_DIGITS":   "🔢 Please choose 6 or 8 digits.",
-            "WAIT_KEY_PERIOD":   "⏱ Please choose 30 or 60 seconds.",
+            "WAIT_KEY_DIGITS":   "🔢 Please choose *6 digits* or *8 digits*.",
+            "WAIT_KEY_PERIOD":   "⏱ Please choose *30 seconds* or *60 seconds*.",
             "WAIT_SVC_NAME":     "🏷 Please send a name for this account.",
             "WAIT_RENAME":       "✏️ Please send the new account name.",
             "WAIT_RENAME_ADD":   "✏️ Please send a unique name for this account.",
@@ -1964,8 +2089,17 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "WAIT_QR":           "📷 Please send the QR code image.",
         }
         hint = hints.get(state, "👆 Use the keyboard buttons to navigate.")
-        await update.message.reply_text(hint, parse_mode=ParseMode.MARKDOWN,
-                                        reply_markup=rkb_cancel() if state else rkb_home())
+        back_dest = ctx.user_data.get("back", "home")
+        if state in ("WAIT_KEY", "WAIT_URI", "WAIT_QR", "WAIT_KEY_DIGITS",
+                     "WAIT_KEY_PERIOD", "WAIT_SVC_NAME", "WAIT_RENAME_ADD"):
+            kb = rkb_cancel_add()
+        elif state in ("WAIT_SET_PIN", "WAIT_CONFIRM_PIN", "WAIT_RESTORE", "WAIT_RENAME"):
+            kb = rkb_cancel_settings()
+        elif state:
+            kb = rkb_cancel()
+        else:
+            kb = rkb_home()
+        await update.message.reply_text(hint, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2405,11 +2539,12 @@ async def _start_rename(q, ctx, svc: str) -> None:
     _cancel_refresh(0)
     ctx.user_data["state"]      = "WAIT_RENAME"
     ctx.user_data["rename_svc"] = svc
+    ctx.user_data["back"]       = "settings"
     await q.edit_message_text(
         f"✏️ *Rename* `{svc}`\n\nSend the new name.",
         parse_mode=ParseMode.MARKDOWN,
     )
-    await q.message.reply_text("Type the new name:", reply_markup=rkb_cancel())
+    await q.message.reply_text("Type the new name:", reply_markup=rkb_cancel_settings())
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2466,6 +2601,7 @@ async def _do_add_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         return
     ctx.user_data["pending_secret"] = secret
     ctx.user_data["state"]          = "WAIT_KEY_DIGITS"
+    ctx.user_data["back"]           = "add"
     await update.effective_chat.send_message(
         "🔢 *How many digits?*\n\nMost services use 6.",
         parse_mode=ParseMode.MARKDOWN,
@@ -2508,10 +2644,11 @@ async def _do_key_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         )
         return
     ctx.user_data["state"] = "WAIT_SVC_NAME"
+    ctx.user_data["back"]  = "add"
     await update.effective_chat.send_message(
         "🏷 *Name this account*\n\nSend a label (e.g. `GitHub`, `Gmail`):",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=rkb_cancel(),
+        reply_markup=rkb_cancel_add(),
     )
 
 
@@ -2866,10 +3003,11 @@ async def _do_set_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         return
     ctx.user_data["pending_pin"] = text
     ctx.user_data["state"]       = "WAIT_CONFIRM_PIN"
+    ctx.user_data["back"]        = "settings"
     await update.effective_chat.send_message(
         "🔁 *Confirm passcode*\n\nEnter the same PIN again:",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=rkb_cancel(),
+        reply_markup=rkb_cancel_settings(),
     )
 
 
@@ -3339,12 +3477,8 @@ async def _do_stats(update: Update, uid: int) -> None:
         f"🕐 Last unlock    : `{unlock_s}`\n"
         f"⏱ Session TTL    : `{SESSION_TTL}s`",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=rkb_settings(),
+        reply_markup=rkb_back_settings(),
     )
-
-
-# ─────────────────────────────────────────────────────────────
-# 23.  SESSION WATCHDOG
 # ─────────────────────────────────────────────────────────────
 async def watchdog(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
