@@ -378,21 +378,6 @@ def audit(uid: int, action: str, detail: str = "") -> None:
 
 
 # ── Passcode Reset DB helpers ────────────────────────────────
-def db_create_reset_request(uid: int, name: str, username: Optional[str]) -> str:
-    """Create a reset request and return its request_id."""
-    request_id = base64.urlsafe_b64encode(os.urandom(9)).decode().rstrip("=")
-    col_reset_requests.insert_one({
-        "request_id": request_id,
-        "uid": uid,
-        "name": name,
-        "username": username,
-        "status": "pending",   # pending → approved / denied
-        "qa": [],              # filled in by the security-question appeal flow
-        "ts": datetime.now(timezone.utc),
-    })
-    return request_id
-
-
 def db_get_reset_request(request_id: str) -> Optional[dict]:
     return col_reset_requests.find_one({"request_id": request_id})
 
@@ -1771,17 +1756,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 )
         return
 
-    # ── TEMP PIN ENTRY (reset flow) ─────────────────────────
-    if state == "WAIT_TEMP_PIN_UNLOCK":
-        try:
-            await update.message.delete()
-        except TelegramError:
-            pass
-        await _do_temp_pin_unlock(update, ctx, uid, text)
-        return
-
     # ── SESSION CHECK ────────────────────────────────────────
-    if not session_alive(uid):
+    # Appeal flow states are allowed through even with a locked vault —
+    # the user can't unlock it (that's why they're appealing).
+    _appeal_states = {f"WAIT_APPEAL_SECQ_{i+1}" for i in range(len(SECURITY_QUESTIONS))} | {"WAIT_APPEAL_CONFIRM"}
+    if not session_alive(uid) and state not in _appeal_states:
         pin_hash = db_get_pin(uid)
         if pin_hash:
             await update.message.reply_text(
@@ -1876,19 +1855,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if state == f"WAIT_APPEAL_SECQ_{_qi + 1}":
             await _do_appeal_secq_answer(update, ctx, uid, text, _qi)
             return
-    # User typed "I agree" after security questions verified → submit to admin
-    if state == "WAIT_APPEAL_CONFIRM":
-        if text.strip().lower() == "i agree":
-            qa_plain = ctx.user_data.pop("appeal_qa_plain", [])
-            ctx.user_data.clear()
-            await _submit_appeal_to_admin(update, ctx, uid, qa_plain)
-        else:
-            await update.effective_chat.send_message(
-                "⚠️ Please type *I agree* to submit your reset request, or tap ❌ Cancel to abort.",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=rkb_cancel(),
-            )
-        return
 
     # ── MAIN MENU BUTTONS ───────────────────────────────────
     if text == "➕ Add Account":
@@ -2580,6 +2546,25 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         request_id = data.split(":", 1)[1]
         await _do_user_agree_reset(q, ctx, uid, request_id)
 
+    # ── APPEAL CONFIRM (user taps Submit after answering questions) ──
+    elif data == "APPEAL_CONFIRM":
+        qa_plain = ctx.user_data.pop("appeal_qa_plain", None)
+        ctx.user_data.pop("state", None)
+        if qa_plain is None:
+            await q.edit_message_text("⚠️ Session lost. Please tap 🆘 Appeal Reset again.")
+            return
+        await q.edit_message_text("⏳ Submitting your appeal…")
+        await _submit_appeal_to_admin(update, ctx, uid, qa_plain)
+
+    # ── APPEAL CANCEL (user taps Cancel on the confirm screen) ──
+    elif data == "APPEAL_CANCEL":
+        ctx.user_data.clear()
+        await q.edit_message_text(
+            "❌ *Appeal cancelled.*\n\nTap 🔓 Unlock Vault if you remember your passcode,\n"
+            "or 🆘 Forgot Passcode? Appeal Reset to try again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
     # ── PAGINATION ──────────────────────────────────────────
     elif data.startswith("PAGE:"):
         parts  = data.split(":", 2)
@@ -3198,9 +3183,6 @@ async def _do_confirm_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 import random
 import string
 
-TEMP_PIN_DELAY_S = 120   # 2 minutes before temp passcode is sent
-
-
 def _generate_temp_pin(length: int = 8) -> str:
     """Generate a random numeric temporary passcode."""
     return "".join(random.choices(string.digits, k=length))
@@ -3250,11 +3232,6 @@ async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: 
 async def _do_appeal_secq_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                                   uid: int, text: str, q_index: int) -> None:
     """Collect appeal answer for security question q_index (0-based)."""
-    try:
-        await update.message.delete()
-    except TelegramError:
-        pass
-
     answers = ctx.user_data.setdefault("appeal_answers", [])
     answers.append(text)
 
@@ -3287,9 +3264,12 @@ async def _do_appeal_secq_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         "📋 *Your answers:*\n\n"
         + qa_display + "\n\n"
         "These answers (alongside your originally saved answers) will be sent to the admin for comparison.\n\n"
-        "_Type_ *I agree* _to submit, or tap ❌ Cancel to abort._",
+        "Tap *✅ Submit Appeal* to send, or ❌ Cancel to abort.",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=rkb_cancel(),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Submit Appeal", callback_data="APPEAL_CONFIRM")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="APPEAL_CANCEL")],
+        ]),
     )
 
 
@@ -3443,7 +3423,7 @@ async def _do_admin_approve_reset(q, ctx, request_id: str) -> None:
                 "The admin has verified your identity and approved your request.\n\n"
                 "🔐 *What happens next:*\n"
                 "• Tap *I Agree* below to confirm you want to proceed\n"
-                "• After *2 minutes*, the bot will send you a temporary passcode\n"
+                "• Your temporary passcode will be sent *immediately*\n"
                 "• Use that temporary passcode to unlock your vault\n"
                 "• You will then be prompted to set a new permanent passcode\n\n"
                 "⚠️ _Do not share the temporary passcode with anyone._"
@@ -3516,84 +3496,47 @@ async def _do_user_agree_reset(q, ctx, uid: int, request_id: str) -> None:
     db_update_reset_status(request_id, "agreed")
     audit(uid, "reset_agreed")
 
+    # Generate and set temp pin immediately
+    temp_pin = _generate_temp_pin(8)
+    db_set_pin(uid, hash_pin(temp_pin))
+    db_set_setting(uid, "temp_pin_pending", True)
+    db_delete_reset_request(request_id)
+    audit(uid, "reset_temp_pin_sent")
+    log.info("Reset agreed — temp pin sent immediately uid=%s request_id=%s", uid, request_id)
+
     await q.edit_message_text(
-        "✅ *Request Confirmed!*\n\n"
-        f"You will receive your temporary passcode in *{TEMP_PIN_DELAY_S // 60} minutes*.\n\n"
-        "⏳ Please wait — do not close the chat.",
+        "✅ *Agreed! Your temporary passcode is below.*\n\n"
+        "Use it right away to unlock your vault.",
         parse_mode=ParseMode.MARKDOWN,
     )
-    log.info("Reset agreed uid=%s request_id=%s — scheduling temp pin in %ds", uid, request_id, TEMP_PIN_DELAY_S)
 
-    # Schedule temp passcode delivery
-    async def _send_temp_pin_after_delay():
-        await asyncio.sleep(TEMP_PIN_DELAY_S)
-        temp_pin = _generate_temp_pin(8)
-        # Store hashed temp pin as the current pin
-        db_set_pin(uid, hash_pin(temp_pin))
-        db_delete_reset_request(request_id)
-        audit(uid, "reset_temp_pin_sent")
-        try:
-            temp_msg = await ctx.bot.send_message(
-                chat_id=uid,
-                text=(
-                    "🔑 *Your Temporary Passcode*\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"`{temp_pin}`\n\n"
-                    "_(tap to copy)_\n\n"
-                    "⚠️ *Important:*\n"
-                    "• Use this code to unlock your vault *right now*\n"
-                    "• You will be required to set a new permanent passcode immediately\n"
-                    "• This message will be deleted in *60 seconds*\n"
-                    "• Never share this code with anyone"
-                ),
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=rkb_unlock(),
-            )
-            log.info("Temp pin sent uid=%s", uid)
-
-            # Auto-delete temp pin message after 60s
-            async def _del_temp_msg(m):
-                await asyncio.sleep(60)
-                try:
-                    await m.delete()
-                except TelegramError:
-                    pass
-
-            asyncio.create_task(_del_temp_msg(temp_msg))
-
-            # Mark user state so the next unlock attempt goes through the forced-change flow
-            # We store a flag in MongoDB so it survives across handler boundaries
-            db_set_setting(uid, "temp_pin_pending", True)
-        except TelegramError as e:
-            log.error("Could not send temp pin uid=%s: %s", uid, e)
-
-    asyncio.create_task(_send_temp_pin_after_delay())
-
-
-async def _do_temp_pin_unlock(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                               uid: int, text: str) -> None:
-    """User enters temp passcode on the lock screen — force new passcode set."""
-    pin_hash = db_get_pin(uid)
-    if pin_hash and verify_pin(text, pin_hash):
-        # Clear attempts/lockout
-        ctx.bot_data.pop(f"pin_lockout_{uid}", None)
-        ctx.bot_data.pop(f"pin_attempts_{uid}", None)
-        session_touch(uid)
-        ctx.user_data["state"] = "WAIT_RESET_NEW_PIN"
-        audit(uid, "reset_temp_unlock")
-        await update.effective_chat.send_message(
-            "✅ *Temporary passcode accepted!*\n\n"
-            "🔑 *You must now set a new permanent passcode.*\n\n"
-            "Send a new 4–8 digit PIN.\n_Message deleted immediately for security._",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=rkb_cancel(),
-        )
-    else:
-        await update.effective_chat.send_message(
-            "❌ *Wrong temporary passcode.*\n\nPlease check the code sent to you and try again.",
+    try:
+        temp_msg = await ctx.bot.send_message(
+            chat_id=uid,
+            text=(
+                "🔑 *Your Temporary Passcode*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"`{temp_pin}`\n\n"
+                "_(tap to copy)_\n\n"
+                "⚠️ *Important:*\n"
+                "• Use this code to unlock your vault *right now*\n"
+                "• You will be required to set a new permanent passcode immediately\n"
+                "• This message will be deleted in *60 seconds*\n"
+                "• Never share this code with anyone"
+            ),
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=rkb_unlock(),
         )
+        # Auto-delete temp pin message after 60 s
+        async def _del_temp_msg(m):
+            await asyncio.sleep(60)
+            try:
+                await m.delete()
+            except TelegramError:
+                pass
+        asyncio.create_task(_del_temp_msg(temp_msg))
+    except TelegramError as e:
+        log.error("Could not send temp pin uid=%s: %s", uid, e)
 
 
 async def _do_reset_new_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
@@ -3631,14 +3574,15 @@ async def _do_reset_confirm_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         )
         return
     db_set_pin(uid, hash_pin(pending))
+    session_kill(uid)
     audit(uid, "reset_new_pin_set")
     log.info("New PIN set after reset uid=%s", uid)
     await update.effective_chat.send_message(
         "🎉 *New Passcode Set Successfully!*\n\n"
-        "Your vault is now protected with your new passcode.\n"
-        "Keep it safe — it cannot be recovered without an admin reset.",
+        "Your vault is now locked. Please unlock it with your new passcode.\n\n"
+        "_Keep it safe — store it somewhere you won't forget._",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=rkb_home(),
+        reply_markup=rkb_unlock(),
     )
 
 
