@@ -4677,6 +4677,26 @@ async def _handle_admin_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                 pass
         return True
 
+    if state == "ADMIN_WAIT_IMPERSONATE":
+        doc = db_find_user(text.strip())
+        if not doc:
+            await update.effective_chat.send_message(
+                f"❌ User not found: `{text.strip()}`\n\nSend a numeric user ID or @username.",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_cancel(),
+            )
+            # Keep state so admin can retry without re-pressing the button
+        else:
+            ctx.user_data.pop("state", None)
+            target_uid = doc["uid"]
+            if target_uid == ADMIN_ID:
+                await update.effective_chat.send_message(
+                    "⚠️ Cannot impersonate yourself.",
+                    reply_markup=rkb_admin_back(),
+                )
+            else:
+                await _admin_enter_user(update, ctx, uid, target_uid)
+        return True
+
     return False
 
 
@@ -4688,6 +4708,15 @@ async def _handle_admin_callback(q, ctx, uid: int, data: str) -> bool:
     """
     if uid != ADMIN_ID:
         return False
+
+    if data.startswith("ADMIN_IMPERSONATE:"):
+        target_uid = int(data.split(":", 1)[1])
+        if target_uid == ADMIN_ID:
+            await q.answer("Cannot impersonate yourself.", show_alert=True)
+        else:
+            await q.answer()
+            await _admin_enter_user(q.message, ctx, uid, target_uid)
+        return True
 
     if data.startswith("ADMIN_BAN:"):
         target_uid = int(data.split(":", 1)[1])
