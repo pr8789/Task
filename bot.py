@@ -416,8 +416,6 @@ def db_create_reset_request_with_qa(uid: int, name: str, username,
 # ── Security Questions DB helpers ────────────────────────────
 SECURITY_QUESTIONS = [
     "What is your recovery email address?",
-    "What was the name of your first pet?",
-    "What is your mother\u2019s maiden name?",
 ]
 
 
@@ -451,7 +449,7 @@ def db_get_security_answers(uid: int):
 
 def db_has_security_answers(uid: int) -> bool:
     ans = db_get_security_answers(uid)
-    return bool(ans and len(ans) == len(SECURITY_QUESTIONS))
+    return bool(ans and len(ans) >= 1)
 
 
 
@@ -1481,6 +1479,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⚠️ Too many requests. Please wait.")
         return
 
+    # ── BAN CHECK ───────────────────────────────────────────
+    if await _check_ban(update):
+        return
+
+    # ── ADMIN PANEL ROUTER ──────────────────────────────────
+    if await _handle_admin_message(update, ctx, uid, text, state):
+        return
+
     # ── CANCEL ──────────────────────────────────────────────
     if text == "❌ Cancel":
         # Block Cancel if user is in the forced new-passcode flow
@@ -2256,6 +2262,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await q.message.reply_text("⚠️ Rate limit — slow down.")
         except TelegramError:
             pass
+        return
+
+    # ── ADMIN CALLBACK ROUTER ────────────────────────────────
+    if await _handle_admin_callback(q, ctx, uid, data):
         return
 
     if not session_alive(uid):
@@ -3164,13 +3174,15 @@ async def _do_confirm_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     log.info("PIN set uid=%s — session killed, collecting security questions", uid)
 
     # ── Proceed to security question setup ──────────────────
+    n = len(SECURITY_QUESTIONS)
+    q_word = "question" if n == 1 else "questions"
     ctx.user_data["state"]       = "WAIT_SECQ_1"
     ctx.user_data["back"]        = "settings"
     await update.effective_chat.send_message(
         "✅ *Passcode set!*\n\n"
-        "🔒 For account recovery, please answer *2 security questions*.\n"
+        f"🔒 For account recovery, please answer *{n} security {q_word}*.\n"
         "These will be used to verify your identity if you ever forget your passcode.\n\n"
-        f"*Question 1 of {len(SECURITY_QUESTIONS)}:*\n"
+        f"*Question 1 of {n}:*\n"
         f"_{SECURITY_QUESTIONS[0]}_",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=rkb_cancel_settings(),
@@ -3724,6 +3736,1035 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
+# 23.  ADMIN PANEL
+# ─────────────────────────────────────────────────────────────
+
+# ── Admin guard decorator ────────────────────────────────────
+def admin_only(func):
+    """Decorator: reject non-admin callers immediately."""
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != ADMIN_ID:
+            await update.effective_message.reply_text("⛔ Admin only.")
+            return
+        return await func(update, ctx)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+
+# ── Admin reply keyboard ─────────────────────────────────────
+def rkb_admin() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("👥 Users"),          KeyboardButton("📊 Global Stats")],
+            [KeyboardButton("📋 Audit Log"),       KeyboardButton("🔔 Pending Resets")],
+            [KeyboardButton("📢 Broadcast"),       KeyboardButton("🔍 User Lookup")],
+            [KeyboardButton("🚫 Ban User"),        KeyboardButton("✅ Unban User")],
+            [KeyboardButton("🗑 Delete User"),     KeyboardButton("💬 Message User")],
+            [KeyboardButton("🔒 Force Lock User"), KeyboardButton("📤 Export All Logs")],
+            [KeyboardButton("⚙️ Bot Config"),      KeyboardButton("🏠 Home")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def rkb_admin_back() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("🔙 Admin Panel")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def rkb_admin_cancel() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("❌ Cancel"), KeyboardButton("🔙 Admin Panel")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+# ── Admin DB helpers ─────────────────────────────────────────
+def db_ban_user(uid: int) -> None:
+    col_users.update_one({"uid": uid}, {"$set": {"banned": True, "banned_at": datetime.now(timezone.utc)}})
+
+
+def db_unban_user(uid: int) -> None:
+    col_users.update_one({"uid": uid}, {"$set": {"banned": False, "banned_at": None}})
+
+
+def db_is_banned(uid: int) -> bool:
+    doc = col_users.find_one({"uid": uid}, {"banned": 1})
+    return bool((doc or {}).get("banned", False))
+
+
+def db_delete_user_all(uid: int) -> dict:
+    """Wipe all data for a user. Returns counts."""
+    accts    = col_accounts.delete_many({"uid": uid}).deleted_count
+    sessions = col_sessions.delete_many({"uid": uid}).deleted_count
+    users    = col_users.delete_many({"uid": uid}).deleted_count
+    col_reset_requests.delete_many({"uid": uid})
+    _session_cache.pop(uid, None)
+    _invalidate_cache(uid)
+    return {"accounts": accts, "sessions": sessions, "users": users}
+
+
+def db_get_all_users(page: int = 0, page_size: int = 10) -> list:
+    return list(col_users.find(
+        {},
+        {"uid": 1, "name": 1, "username": 1, "joined": 1, "last_seen": 1,
+         "banned": 1, "last_unlock": 1},
+    ).sort("joined", -1).skip(page * page_size).limit(page_size))
+
+
+def db_count_users() -> int:
+    return col_users.count_documents({})
+
+
+def db_find_user(query: str) -> Optional[dict]:
+    """Find a user by UID (int string) or @username."""
+    if query.lstrip("-").isdigit():
+        return col_users.find_one({"uid": int(query)})
+    uname = query.lstrip("@")
+    return col_users.find_one({"username": {"$regex": f"^{re.escape(uname)}$", "$options": "i"}})
+
+
+def db_get_recent_audit(limit: int = 20, uid_filter: Optional[int] = None) -> list:
+    filt = {"uid": uid_filter} if uid_filter else {}
+    return list(col_audit.find(filt, {"_id": 0}).sort("ts", -1).limit(limit))
+
+
+def db_global_stats() -> dict:
+    total_users    = col_users.count_documents({})
+    banned_users   = col_users.count_documents({"banned": True})
+    total_accounts = col_accounts.count_documents({})
+    active_sessions = col_sessions.count_documents({})
+    pending_resets = col_reset_requests.count_documents({"status": "pending"})
+    now = datetime.now(timezone.utc)
+    new_users_24h = col_users.count_documents({"joined": {"$gte": now - timedelta(hours=24)}})
+    audit_24h     = col_audit.count_documents({"ts": {"$gte": now - timedelta(hours=24)}})
+    audit_7d      = col_audit.count_documents({"ts": {"$gte": now - timedelta(days=7)}})
+    # Top action breakdown from last 7 days
+    pipe = [
+        {"$match": {"ts": {"$gte": now - timedelta(days=7)}}},
+        {"$group": {"_id": "$action", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 8},
+    ]
+    action_rows = list(col_audit.aggregate(pipe))
+    return {
+        "total_users": total_users,
+        "banned_users": banned_users,
+        "total_accounts": total_accounts,
+        "active_sessions": active_sessions,
+        "pending_resets": pending_resets,
+        "new_users_24h": new_users_24h,
+        "audit_24h": audit_24h,
+        "audit_7d": audit_7d,
+        "action_rows": action_rows,
+    }
+
+
+# ── Inline keyboards for admin ───────────────────────────────
+def ikb_admin_user_actions(target_uid: int, banned: bool) -> InlineKeyboardMarkup:
+    ban_label  = "✅ Unban" if banned else "🚫 Ban"
+    ban_cb     = f"ADMIN_UNBAN:{target_uid}" if banned else f"ADMIN_BAN:{target_uid}"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(ban_label,            callback_data=ban_cb),
+            InlineKeyboardButton("🗑 Delete All Data",  callback_data=f"ADMIN_DEL_USER:{target_uid}"),
+        ],
+        [
+            InlineKeyboardButton("🔒 Force Lock",      callback_data=f"ADMIN_LOCK:{target_uid}"),
+            InlineKeyboardButton("💬 Send Message",    callback_data=f"ADMIN_MSG:{target_uid}"),
+        ],
+        [
+            InlineKeyboardButton("📋 Audit Trail",     callback_data=f"ADMIN_AUDIT:{target_uid}"),
+            InlineKeyboardButton("📊 User Stats",      callback_data=f"ADMIN_USTATS:{target_uid}"),
+        ],
+    ])
+
+
+def ikb_admin_confirm_delete(target_uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚠️ YES — Delete Everything", callback_data=f"ADMIN_DEL_CONFIRM:{target_uid}"),
+            InlineKeyboardButton("❌ Cancel",                   callback_data="ADMIN_CANCEL"),
+        ]
+    ])
+
+
+def ikb_admin_users_page(page: int, total: int, page_size: int = 10) -> InlineKeyboardMarkup:
+    rows = []
+    nav  = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"ADMIN_USERS_PAGE:{page-1}"))
+    if (page + 1) * page_size < total:
+        nav.append(InlineKeyboardButton("▶️ Next", callback_data=f"ADMIN_USERS_PAGE:{page+1}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+# ── Admin command: /admin ─────────────────────────────────────
+@admin_only
+async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data.clear()
+    ctx.user_data["admin_mode"] = True
+    stats = db_global_stats()
+    await update.message.reply_text(
+        "🛡 *NexAuth Admin Panel*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Users        : `{stats['total_users']}`  _(+{stats['new_users_24h']} today)_\n"
+        f"🔐 Accounts     : `{stats['total_accounts']}`\n"
+        f"🔓 Sessions     : `{stats['active_sessions']}`\n"
+        f"🚫 Banned       : `{stats['banned_users']}`\n"
+        f"🔔 Pending resets: `{stats['pending_resets']}`\n"
+        f"📋 Actions 24h  : `{stats['audit_24h']}`\n\n"
+        "Use the panel below to manage the bot.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin(),
+    )
+
+
+# ── Admin: global stats ──────────────────────────────────────
+@admin_only
+async def _admin_global_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = db_global_stats()
+    action_lines = "\n".join(
+        f"  `{r['_id']}` — {r['count']}" for r in s["action_rows"]
+    ) or "  _(none)_"
+    await update.effective_chat.send_message(
+        "📊 *Global Bot Statistics*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Total users       : `{s['total_users']}`\n"
+        f"  └ New (24h)        : `{s['new_users_24h']}`\n"
+        f"  └ Banned           : `{s['banned_users']}`\n"
+        f"🔐 Total accounts    : `{s['total_accounts']}`\n"
+        f"🔓 Active sessions   : `{s['active_sessions']}`\n"
+        f"🔔 Pending resets    : `{s['pending_resets']}`\n"
+        f"📋 Audit events 24h  : `{s['audit_24h']}`\n"
+        f"📋 Audit events 7d   : `{s['audit_7d']}`\n\n"
+        f"*Top actions (7d):*\n{action_lines}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_back(),
+    )
+
+
+# ── Admin: list users ────────────────────────────────────────
+async def _admin_list_users(update_or_q, ctx, page: int = 0) -> None:
+    page_size = 10
+    total     = db_count_users()
+    users     = db_get_all_users(page, page_size)
+    if not users:
+        text = "👥 *No users registered.*"
+        markup = rkb_admin_back()
+    else:
+        lines = []
+        for u in users:
+            j     = u.get("joined")
+            j_str = j.strftime("%m-%d") if j else "?"
+            ban   = " 🚫" if u.get("banned") else ""
+            uname = f"@{u['username']}" if u.get("username") else "—"
+            lines.append(f"`{u['uid']}`  {u.get('name','?')[:16]}  {uname}  _{j_str}_{ban}")
+        start = page * page_size + 1
+        end   = min(start + page_size - 1, total)
+        text  = (
+            f"👥 *Users {start}–{end} of {total}*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + "\n".join(lines)
+        )
+        markup = ikb_admin_users_page(page, total, page_size)
+
+    if hasattr(update_or_q, "edit_message_text"):
+        try:
+            await update_or_q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        except Exception:
+            pass
+    else:
+        await update_or_q.effective_chat.send_message(
+            text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=markup or rkb_admin_back(),
+        )
+
+
+# ── Admin: audit log ────────────────────────────────────────
+@admin_only
+async def _admin_audit_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                            uid_filter: Optional[int] = None) -> None:
+    rows = db_get_recent_audit(limit=25, uid_filter=uid_filter)
+    if not rows:
+        await update.effective_chat.send_message(
+            "📋 *Audit log is empty.*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin_back(),
+        )
+        return
+    lines = []
+    for r in rows:
+        ts     = r["ts"].strftime("%m-%d %H:%M") if r.get("ts") else "?"
+        action = r.get("action", "?")
+        detail = f" `{r['detail']}`" if r.get("detail") else ""
+        uid_s  = f"`{r['uid']}`" if uid_filter is None else ""
+        lines.append(f"`{ts}` {uid_s} *{action}*{detail}")
+    header = f"📋 *Audit Log* {'for user `'+str(uid_filter)+'`' if uid_filter else '(global, last 25)'}"
+    await update.effective_chat.send_message(
+        header + "\n━━━━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_back(),
+    )
+
+
+# ── Admin: pending resets ────────────────────────────────────
+@admin_only
+async def _admin_pending_resets(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    reqs = list(col_reset_requests.find(
+        {"status": "pending"},
+        {"request_id": 1, "uid": 1, "name": 1, "username": 1, "ts": 1, "_id": 0},
+    ).sort("ts", -1).limit(20))
+    if not reqs:
+        await update.effective_chat.send_message(
+            "🔔 *No pending reset requests.*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin_back(),
+        )
+        return
+    lines = []
+    for r in reqs:
+        ts    = r["ts"].strftime("%m-%d %H:%M") if r.get("ts") else "?"
+        uname = f"@{r['username']}" if r.get("username") else "—"
+        lines.append(
+            f"`{ts}` — {r.get('name','?')} {uname} `{r['uid']}`\n"
+            f"  ↳ /resetreview_{r['request_id'][:8]}"
+        )
+    await update.effective_chat.send_message(
+        f"🔔 *Pending Reset Requests* ({len(reqs)})\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_back(),
+    )
+
+
+# ── Admin: user lookup ───────────────────────────────────────
+@admin_only
+async def _admin_user_lookup(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                              query: str) -> None:
+    doc = db_find_user(query)
+    if not doc:
+        await update.effective_chat.send_message(
+            f"❌ *User not found:* `{query}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin_back(),
+        )
+        return
+    target_uid = doc["uid"]
+    acct_count = col_accounts.count_documents({"uid": target_uid})
+    joined     = doc.get("joined")
+    last_seen  = doc.get("last_seen")
+    last_unlock = doc.get("last_unlock")
+    banned     = bool(doc.get("banned"))
+    has_pin    = bool(db_get_pin(target_uid))
+    has_secq   = db_has_security_answers(target_uid)
+    active     = session_alive(target_uid)
+    uname      = f"@{doc['username']}" if doc.get("username") else "—"
+    await update.effective_chat.send_message(
+        f"👤 *User Profile*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 UID         : `{target_uid}`\n"
+        f"👤 Name        : {doc.get('name','?')}\n"
+        f"🔗 Username    : {uname}\n"
+        f"📅 Joined      : `{joined.strftime('%Y-%m-%d') if joined else '?'}`\n"
+        f"👁 Last seen   : `{_human_age(last_seen) if last_seen else '?'}`\n"
+        f"🔓 Last unlock : `{_human_age(last_unlock) if last_unlock else 'Never'}`\n"
+        f"🔐 Accounts    : `{acct_count}`\n"
+        f"🔑 Passcode    : {'✅ Set' if has_pin else '❌ Not set'}\n"
+        f"🛡 Security Q  : {'✅ Set' if has_secq else '❌ Not set'}\n"
+        f"📡 Session     : {'🟢 Active' if active else '⚫ Inactive'}\n"
+        f"🚫 Banned      : {'⚠️ YES' if banned else '✅ No'}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ikb_admin_user_actions(target_uid, banned),
+    )
+
+
+# ── Admin: ban / unban ───────────────────────────────────────
+async def _admin_do_ban(q, target_uid: int) -> None:
+    db_ban_user(target_uid)
+    session_kill(target_uid)
+    audit(target_uid, "admin_ban", str(ADMIN_ID))
+    log.info("Admin banned uid=%s", target_uid)
+    doc     = col_users.find_one({"uid": target_uid}) or {}
+    banned  = True
+    await q.edit_message_reply_markup(reply_markup=ikb_admin_user_actions(target_uid, banned))
+    await q.message.reply_text(
+        f"🚫 *User `{target_uid}` has been banned.*\nTheir session was killed.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    # Notify the user
+    try:
+        await q.bot.send_message(
+            chat_id=target_uid,
+            text="🚫 *Your account has been suspended.*\nPlease contact the admin.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except TelegramError:
+        pass
+
+
+async def _admin_do_unban(q, target_uid: int) -> None:
+    db_unban_user(target_uid)
+    audit(target_uid, "admin_unban", str(ADMIN_ID))
+    log.info("Admin unbanned uid=%s", target_uid)
+    await q.edit_message_reply_markup(reply_markup=ikb_admin_user_actions(target_uid, False))
+    await q.message.reply_text(
+        f"✅ *User `{target_uid}` has been unbanned.*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        await q.bot.send_message(
+            chat_id=target_uid,
+            text="✅ *Your account has been reinstated.*\nYou can use NexAuth again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except TelegramError:
+        pass
+
+
+# ── Admin: force lock user ───────────────────────────────────
+async def _admin_force_lock(q, target_uid: int) -> None:
+    session_kill(target_uid)
+    audit(target_uid, "admin_force_lock", str(ADMIN_ID))
+    log.info("Admin force-locked uid=%s", target_uid)
+    await q.message.reply_text(
+        f"🔒 *User `{target_uid}` session force-locked.*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        await q.bot.send_message(
+            chat_id=target_uid,
+            text="🔒 *Your vault has been locked by the admin.*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_unlock(),
+        )
+    except TelegramError:
+        pass
+
+
+# ── Admin: per-user stats (from inline button) ───────────────
+async def _admin_user_stats(q, target_uid: int) -> None:
+    acct_count = col_accounts.count_documents({"uid": target_uid})
+    starred    = col_accounts.count_documents({"uid": target_uid, "starred": True})
+    has_pin    = bool(db_get_pin(target_uid))
+    doc        = col_users.find_one({"uid": target_uid}) or {}
+    joined     = doc.get("joined")
+    last_unlock = doc.get("last_unlock")
+    audit_count = col_audit.count_documents({"uid": target_uid})
+    pending_reset = db_get_reset_request_by_uid(target_uid)
+    await q.message.reply_text(
+        f"📊 *User Stats — `{target_uid}`*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔐 Accounts     : `{acct_count}`\n"
+        f"⭐ Starred      : `{starred}`\n"
+        f"🔑 Passcode     : {'✅ Set' if has_pin else '❌ Not set'}\n"
+        f"📋 Audit events : `{audit_count}`\n"
+        f"📅 Joined       : `{joined.strftime('%Y-%m-%d') if joined else '?'}`\n"
+        f"🔓 Last unlock  : `{_human_age(last_unlock) if last_unlock else 'Never'}`\n"
+        f"🔔 Pending reset: {'⚠️ Yes' if pending_reset else '✅ No'}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ── Admin: send message to user ──────────────────────────────
+async def _admin_do_send_message(q, ctx, target_uid: int, text: str) -> None:
+    try:
+        await q.bot.send_message(
+            chat_id=target_uid,
+            text=f"📩 *Message from Admin*\n\n{text}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        audit(target_uid, "admin_message", text[:64])
+        await ctx.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"✅ Message delivered to `{target_uid}`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except TelegramError as e:
+        await ctx.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"❌ Could not deliver to `{target_uid}`: {e}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+# ── Admin: export audit log as text file ─────────────────────
+@admin_only
+async def _admin_export_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    rows = list(col_audit.find({}, {"_id": 0}).sort("ts", -1).limit(500))
+    if not rows:
+        await update.effective_chat.send_message(
+            "📋 Audit log is empty.", reply_markup=rkb_admin_back()
+        )
+        return
+    lines = []
+    for r in rows:
+        ts     = r["ts"].strftime("%Y-%m-%d %H:%M:%S UTC") if r.get("ts") else "?"
+        lines.append(f"{ts}  uid={r.get('uid','?')}  action={r.get('action','?')}  detail={r.get('detail','')}")
+    content = "\n".join(lines).encode()
+    bio     = io.BytesIO(content)
+    bio.name = f"nexauth_audit_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.txt"
+    await update.effective_chat.send_document(
+        document=bio,
+        caption="📤 *Audit log export* (last 500 entries)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    audit(ADMIN_ID, "admin_export_logs")
+
+
+# ── Admin: bot config view ────────────────────────────────────
+@admin_only
+async def _admin_bot_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_chat.send_message(
+        "⚙️ *Bot Configuration*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ Session TTL     : `{SESSION_TTL}s` ({SESSION_TTL//60}min)\n"
+        f"🔒 PIN lockout     : `{PIN_LOCKOUT_S}s` ({PIN_LOCKOUT_S//60}min)\n"
+        f"📤 Export TTL      : `{EXPORT_TTL_S}s`\n"
+        f"💾 Backup TTL      : `{BACKUP_TTL_S}s`\n"
+        f"🔕 Paranoid TTL    : `{PARANOID_TTL_S}s`\n"
+        f"📄 Page size       : `{PAGE_SIZE}`\n"
+        f"🔑 Admin UID       : `{ADMIN_ID}`\n"
+        f"🛡 Security Qs     : `{len(SECURITY_QUESTIONS)}`\n\n"
+        "_These values are set via environment variables and .env file._",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_back(),
+    )
+
+
+# ── Admin: broadcast (interactive, from admin panel) ─────────
+@admin_only
+async def _admin_start_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"]      = "ADMIN_WAIT_BROADCAST"
+    ctx.user_data["admin_mode"] = True
+    await update.effective_chat.send_message(
+        "📢 *Broadcast*\n\nSend the message text you want to broadcast to all users.\n"
+        "_Supports Markdown formatting._",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_cancel(),
+    )
+
+
+# ── Admin: start user-lookup flow ────────────────────────────
+@admin_only
+async def _admin_start_lookup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"]      = "ADMIN_WAIT_LOOKUP"
+    ctx.user_data["admin_mode"] = True
+    await update.effective_chat.send_message(
+        "🔍 *User Lookup*\n\nSend a user ID (number) or @username.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_cancel(),
+    )
+
+
+# ── Admin: start ban flow ─────────────────────────────────────
+@admin_only
+async def _admin_start_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"]      = "ADMIN_WAIT_BAN"
+    ctx.user_data["admin_mode"] = True
+    await update.effective_chat.send_message(
+        "🚫 *Ban User*\n\nSend the user ID or @username to ban.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_cancel(),
+    )
+
+
+# ── Admin: start unban flow ───────────────────────────────────
+@admin_only
+async def _admin_start_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"]      = "ADMIN_WAIT_UNBAN"
+    ctx.user_data["admin_mode"] = True
+    await update.effective_chat.send_message(
+        "✅ *Unban User*\n\nSend the user ID or @username to unban.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_cancel(),
+    )
+
+
+# ── Admin: start delete-user flow ────────────────────────────
+@admin_only
+async def _admin_start_delete_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"]      = "ADMIN_WAIT_DELETE_USER"
+    ctx.user_data["admin_mode"] = True
+    await update.effective_chat.send_message(
+        "🗑 *Delete User*\n\n⚠️ This wipes ALL data for a user permanently.\n\n"
+        "Send the user ID or @username.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_cancel(),
+    )
+
+
+# ── Admin: start message-user flow ───────────────────────────
+@admin_only
+async def _admin_start_message_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"]      = "ADMIN_WAIT_MSG_TARGET"
+    ctx.user_data["admin_mode"] = True
+    await update.effective_chat.send_message(
+        "💬 *Message User*\n\nSend the user ID or @username of the recipient.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_cancel(),
+    )
+
+
+# ── Admin: start force-lock flow ─────────────────────────────
+@admin_only
+async def _admin_start_force_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"]      = "ADMIN_WAIT_FORCE_LOCK"
+    ctx.user_data["admin_mode"] = True
+    await update.effective_chat.send_message(
+        "🔒 *Force Lock User*\n\nSend the user ID or @username to force-lock.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_cancel(),
+    )
+
+
+# ── Admin /resetreview_<id> command ──────────────────────────
+async def cmd_resetreview(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    # Extract the partial request_id from the command text
+    text    = update.message.text or ""
+    partial = text.split("_", 1)[-1].strip()   # /resetreview_XXXXXXXX → XXXXXXXX
+    if not partial:
+        await update.message.reply_text("Usage: /resetreview_<request_id_prefix>")
+        return
+    req = col_reset_requests.find_one(
+        {"request_id": {"$regex": f"^{re.escape(partial)}"}},
+    )
+    if not req:
+        await update.message.reply_text(f"❌ Reset request not found: `{partial}`",
+                                         parse_mode=ParseMode.MARKDOWN)
+        return
+    stored_plain = db_get_security_answers_plain(req["uid"]) or []
+    qa_section   = ""
+    if req.get("qa"):
+        lines = []
+        for i, item in enumerate(req["qa"]):
+            stored_ans = stored_plain[i] if i < len(stored_plain) else "_(not stored)_"
+            lines.append(
+                f"*Q{i+1}:* {item['q']}\n"
+                f"  📂 Stored : `{stored_ans}`\n"
+                f"  ✏️ User   : `{item['a']}`"
+            )
+        qa_section = "\n\n🔍 *Q&A Comparison:*\n" + "\n\n".join(lines)
+    else:
+        qa_section = "\n\n⚠️ _No security questions set._"
+    ts  = req["ts"].strftime("%Y-%m-%d %H:%M UTC") if req.get("ts") else "?"
+    uname = f"@{req['username']}" if req.get("username") else "—"
+    await update.message.reply_text(
+        f"🔔 *Reset Request Review*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Name     : {req.get('name','?')}\n"
+        f"🔗 Username : {uname}\n"
+        f"🆔 UID      : `{req['uid']}`\n"
+        f"🕐 Time     : {ts}\n"
+        f"📌 Status   : `{req.get('status','?')}`"
+        + qa_section,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ikb_admin_reset(req["request_id"]),
+    )
+
+
+# ── Ban enforcement hook ─────────────────────────────────────
+# Injected at the top of on_message so banned users get an immediate block.
+async def _check_ban(update: Update) -> bool:
+    """Returns True if the user is banned (caller should return early)."""
+    uid = update.effective_user.id if update.effective_user else None
+    if uid and uid != ADMIN_ID and db_is_banned(uid):
+        try:
+            await update.effective_chat.send_message(
+                "🚫 *Your account has been suspended.*\nContact the admin for assistance."
+                if not update.effective_chat.send_message else
+                "🚫 Your account is suspended.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+        return True
+    return False
+
+
+# ── Admin message router (handles admin panel button presses) ─
+async def _handle_admin_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                  uid: int, text: str, state: str) -> bool:
+    """
+    Called from on_message BEFORE the regular router.
+    Returns True if the message was consumed by the admin flow.
+    """
+    if uid != ADMIN_ID:
+        return False
+
+    # ── Back to admin panel ──────────────────────────────────
+    if text == "🔙 Admin Panel":
+        ctx.user_data.clear()
+        ctx.user_data["admin_mode"] = True
+        stats = db_global_stats()
+        await update.effective_chat.send_message(
+            "🛡 *Admin Panel*\n"
+            f"👥 `{stats['total_users']}` users · 🔐 `{stats['total_accounts']}` accounts · "
+            f"🔔 `{stats['pending_resets']}` pending resets",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin(),
+        )
+        return True
+
+    # ── Admin panel main buttons ─────────────────────────────
+    if text == "👥 Users":
+        await _admin_list_users(update, ctx, page=0)
+        return True
+    if text == "📊 Global Stats":
+        await _admin_global_stats(update, ctx)
+        return True
+    if text == "📋 Audit Log":
+        await _admin_audit_log(update, ctx)
+        return True
+    if text == "🔔 Pending Resets":
+        await _admin_pending_resets(update, ctx)
+        return True
+    if text == "📢 Broadcast":
+        await _admin_start_broadcast(update, ctx)
+        return True
+    if text == "🔍 User Lookup":
+        await _admin_start_lookup(update, ctx)
+        return True
+    if text == "🚫 Ban User":
+        await _admin_start_ban(update, ctx)
+        return True
+    if text == "✅ Unban User":
+        await _admin_start_unban(update, ctx)
+        return True
+    if text == "🗑 Delete User":
+        await _admin_start_delete_user(update, ctx)
+        return True
+    if text == "💬 Message User":
+        await _admin_start_message_user(update, ctx)
+        return True
+    if text == "🔒 Force Lock User":
+        await _admin_start_force_lock(update, ctx)
+        return True
+    if text == "📤 Export All Logs":
+        await _admin_export_logs(update, ctx)
+        return True
+    if text == "⚙️ Bot Config":
+        await _admin_bot_config(update, ctx)
+        return True
+    # "🏠 Home" exits admin mode and goes to regular home
+    if text == "🏠 Home" and ctx.user_data.get("admin_mode"):
+        ctx.user_data.clear()
+        # Fall through to regular home handler below
+        return False
+
+    # ── Admin wait-states ────────────────────────────────────
+    if state == "ADMIN_WAIT_BROADCAST":
+        if text in ("❌ Cancel", "🔙 Admin Panel"):
+            return False  # let the Cancel/Back handler run
+        # Run broadcast using existing cmd_broadcast logic
+        users = list(col_users.find({}, {"uid": 1}))
+        total = len(users)
+        prog  = await update.effective_chat.send_message(
+            f"📢 Broadcasting to {total} user(s)…",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        sent = failed = blocked = 0
+        for i, u in enumerate(users, 1):
+            try:
+                await ctx.bot.send_message(
+                    u["uid"],
+                    f"📢 *Announcement*\n\n{text}",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                sent += 1
+            except TelegramError as e:
+                err = str(e).lower()
+                if any(x in err for x in ("blocked", "deactivated", "not found", "forbidden")):
+                    blocked += 1
+                else:
+                    failed += 1
+            await asyncio.sleep(0.05)
+            if i % 25 == 0 or i == total:
+                try:
+                    await prog.edit_text(
+                        f"📢 `{i}/{total}` — ✅{sent} 🚫{blocked} ❌{failed}",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except TelegramError:
+                    pass
+        ctx.user_data.pop("state", None)
+        try:
+            await prog.edit_text(
+                f"✅ *Broadcast done*\n• Sent: `{sent}`\n• Blocked: `{blocked}`\n• Errors: `{failed}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except TelegramError:
+            pass
+        audit(ADMIN_ID, "admin_broadcast", f"sent={sent}")
+        await update.effective_chat.send_message("Back to panel.", reply_markup=rkb_admin())
+        return True
+
+    if state == "ADMIN_WAIT_LOOKUP":
+        ctx.user_data.pop("state", None)
+        await _admin_user_lookup(update, ctx, text.strip())
+        return True
+
+    if state == "ADMIN_WAIT_BAN":
+        ctx.user_data.pop("state", None)
+        doc = db_find_user(text.strip())
+        if not doc:
+            await update.effective_chat.send_message(
+                f"❌ User not found: `{text.strip()}`",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_back(),
+            )
+        else:
+            db_ban_user(doc["uid"])
+            session_kill(doc["uid"])
+            audit(doc["uid"], "admin_ban", str(ADMIN_ID))
+            await update.effective_chat.send_message(
+                f"🚫 *User `{doc['uid']}` banned and session killed.*",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_back(),
+            )
+            try:
+                await ctx.bot.send_message(
+                    doc["uid"],
+                    "🚫 *Your account has been suspended.*\nContact the admin.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except TelegramError:
+                pass
+        return True
+
+    if state == "ADMIN_WAIT_UNBAN":
+        ctx.user_data.pop("state", None)
+        doc = db_find_user(text.strip())
+        if not doc:
+            await update.effective_chat.send_message(
+                f"❌ User not found: `{text.strip()}`",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_back(),
+            )
+        else:
+            db_unban_user(doc["uid"])
+            audit(doc["uid"], "admin_unban", str(ADMIN_ID))
+            await update.effective_chat.send_message(
+                f"✅ *User `{doc['uid']}` unbanned.*",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_back(),
+            )
+            try:
+                await ctx.bot.send_message(
+                    doc["uid"],
+                    "✅ *Your account has been reinstated.*",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except TelegramError:
+                pass
+        return True
+
+    if state == "ADMIN_WAIT_DELETE_USER":
+        ctx.user_data.pop("state", None)
+        doc = db_find_user(text.strip())
+        if not doc:
+            await update.effective_chat.send_message(
+                f"❌ User not found: `{text.strip()}`",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_back(),
+            )
+        else:
+            target_uid = doc["uid"]
+            ctx.user_data["admin_delete_uid"] = target_uid
+            ctx.user_data["state"] = "ADMIN_WAIT_DELETE_CONFIRM"
+            await update.effective_chat.send_message(
+                f"⚠️ *Confirm Delete*\n\n"
+                f"This will permanently wipe *all data* for:\n"
+                f"👤 `{target_uid}` — {doc.get('name','?')}\n\n"
+                f"Are you absolutely sure?",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ikb_admin_confirm_delete(target_uid),
+            )
+        return True
+
+    if state == "ADMIN_WAIT_MSG_TARGET":
+        doc = db_find_user(text.strip())
+        if not doc:
+            ctx.user_data.pop("state", None)
+            await update.effective_chat.send_message(
+                f"❌ User not found: `{text.strip()}`",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_back(),
+            )
+        else:
+            ctx.user_data["admin_msg_target"] = doc["uid"]
+            ctx.user_data["state"] = "ADMIN_WAIT_MSG_TEXT"
+            await update.effective_chat.send_message(
+                f"💬 *Message to `{doc['uid']}`*\n\nNow send the message text.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_admin_cancel(),
+            )
+        return True
+
+    if state == "ADMIN_WAIT_MSG_TEXT":
+        target_uid = ctx.user_data.pop("admin_msg_target", None)
+        ctx.user_data.pop("state", None)
+        if not target_uid:
+            await update.effective_chat.send_message("⚠️ Session lost.", reply_markup=rkb_admin())
+            return True
+        try:
+            await ctx.bot.send_message(
+                chat_id=target_uid,
+                text=f"📩 *Message from Admin*\n\n{text}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            audit(target_uid, "admin_message", text[:64])
+            await update.effective_chat.send_message(
+                f"✅ Message delivered to `{target_uid}`.",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_back(),
+            )
+        except TelegramError as e:
+            await update.effective_chat.send_message(
+                f"❌ Delivery failed: {e}", reply_markup=rkb_admin_back()
+            )
+        return True
+
+    if state == "ADMIN_WAIT_FORCE_LOCK":
+        ctx.user_data.pop("state", None)
+        doc = db_find_user(text.strip())
+        if not doc:
+            await update.effective_chat.send_message(
+                f"❌ User not found: `{text.strip()}`",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_back(),
+            )
+        else:
+            target_uid = doc["uid"]
+            session_kill(target_uid)
+            audit(target_uid, "admin_force_lock", str(ADMIN_ID))
+            await update.effective_chat.send_message(
+                f"🔒 *User `{target_uid}` session killed.*",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_back(),
+            )
+            try:
+                await ctx.bot.send_message(
+                    target_uid,
+                    "🔒 *Your vault has been locked by the admin.*",
+                    parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_unlock(),
+                )
+            except TelegramError:
+                pass
+        return True
+
+    return False
+
+
+# ── Admin inline callback router (injected into on_button) ────
+async def _handle_admin_callback(q, ctx, uid: int, data: str) -> bool:
+    """
+    Called from on_button BEFORE the main router.
+    Returns True if consumed.
+    """
+    if uid != ADMIN_ID:
+        return False
+
+    if data.startswith("ADMIN_BAN:"):
+        target_uid = int(data.split(":", 1)[1])
+        await _admin_do_ban(q, target_uid)
+        return True
+
+    if data.startswith("ADMIN_UNBAN:"):
+        target_uid = int(data.split(":", 1)[1])
+        await _admin_do_unban(q, target_uid)
+        return True
+
+    if data.startswith("ADMIN_LOCK:"):
+        target_uid = int(data.split(":", 1)[1])
+        await _admin_force_lock(q, target_uid)
+        return True
+
+    if data.startswith("ADMIN_MSG:"):
+        target_uid = int(data.split(":", 1)[1])
+        ctx.user_data["admin_msg_target"] = target_uid
+        ctx.user_data["state"]            = "ADMIN_WAIT_MSG_TEXT"
+        ctx.user_data["admin_mode"]       = True
+        await q.message.reply_text(
+            f"💬 *Message to `{target_uid}`*\n\nSend the message text now.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin_cancel(),
+        )
+        return True
+
+    if data.startswith("ADMIN_AUDIT:"):
+        target_uid = int(data.split(":", 1)[1])
+        rows = db_get_recent_audit(limit=15, uid_filter=target_uid)
+        if not rows:
+            await q.message.reply_text("📋 No audit entries for this user.")
+            return True
+        lines = [
+            f"`{r['ts'].strftime('%m-%d %H:%M')}` *{r.get('action','?')}*"
+            + (f" `{r['detail']}`" if r.get("detail") else "")
+            for r in rows
+        ]
+        await q.message.reply_text(
+            f"📋 *Audit trail for `{target_uid}`* (last 15)\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+
+    if data.startswith("ADMIN_USTATS:"):
+        target_uid = int(data.split(":", 1)[1])
+        await _admin_user_stats(q, target_uid)
+        return True
+
+    if data.startswith("ADMIN_DEL_USER:"):
+        target_uid = int(data.split(":", 1)[1])
+        doc = col_users.find_one({"uid": target_uid}) or {}
+        await q.edit_message_reply_markup(reply_markup=ikb_admin_confirm_delete(target_uid))
+        await q.message.reply_text(
+            f"⚠️ *Confirm: permanently delete all data for `{target_uid}`* ({doc.get('name','?')})?",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+
+    if data.startswith("ADMIN_DEL_CONFIRM:"):
+        target_uid = int(data.split(":", 1)[1])
+        result = db_delete_user_all(target_uid)
+        session_kill(target_uid)
+        audit(ADMIN_ID, "admin_delete_user", str(target_uid))
+        log.info("Admin deleted uid=%s data=%s", target_uid, result)
+        await q.edit_message_text(
+            f"🗑 *User `{target_uid}` fully deleted.*\n"
+            f"• Accounts: `{result['accounts']}`\n"
+            f"• Sessions: `{result['sessions']}`\n"
+            f"• User doc: `{result['users']}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        try:
+            await ctx.bot.send_message(
+                chat_id=target_uid,
+                text="🗑 Your account and all data have been removed by the admin.",
+            )
+        except TelegramError:
+            pass
+        return True
+
+    if data == "ADMIN_CANCEL":
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except (BadRequest, TelegramError):
+            pass
+        return True
+
+    if data.startswith("ADMIN_USERS_PAGE:"):
+        page = int(data.split(":", 1)[1])
+        await _admin_list_users(q, ctx, page=page)
+        return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────
 # 25.  MAIN
 # ─────────────────────────────────────────────────────────────
 def main() -> None:
@@ -3737,6 +4778,11 @@ def main() -> None:
     app.add_handler(CommandHandler("digest",       cmd_digest))
     app.add_handler(CommandHandler("broadcast",    cmd_broadcast))
     app.add_handler(CommandHandler("admin_stats",  cmd_admin_stats))
+    app.add_handler(CommandHandler("admin",        cmd_admin))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^/resetreview_") & filters.TEXT,
+        cmd_resetreview,
+    ))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
