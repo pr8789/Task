@@ -496,6 +496,8 @@ def session_touch(uid: int) -> None:
 
 async def _auto_lock_user(uid: int) -> None:
     """Sleep for SESSION_TTL then lock the user and send a notification."""
+    if uid == ADMIN_ID:
+        return  # Admin is never auto-locked
     try:
         await asyncio.sleep(SESSION_TTL)
     except asyncio.CancelledError:
@@ -5433,7 +5435,890 @@ async def _do_stats_for(update: Update, target_uid: int, tname: str) -> None:
 # when admin is impersonating.  The patch is added in on_button below.
 
 # ─────────────────────────────────────────────────────────────
-# 25.  MAIN
+# 25.  ADVANCED ADMIN PANEL FEATURES
+# ─────────────────────────────────────────────────────────────
+
+# ── Runtime config store (in-memory, persisted to MongoDB) ───
+_runtime_config_col = _db["runtime_config"]
+
+def rc_get(key: str, default=None):
+    """Get a runtime config value from MongoDB."""
+    doc = _runtime_config_col.find_one({"key": key})
+    return doc["value"] if doc else default
+
+def rc_set(key: str, value) -> None:
+    """Set a runtime config value in MongoDB."""
+    _runtime_config_col.update_one(
+        {"key": key}, {"$set": {"key": key, "value": value, "updated": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+
+def rc_delete(key: str) -> None:
+    _runtime_config_col.delete_one({"key": key})
+
+
+# ── Maintenance mode ─────────────────────────────────────────
+def is_maintenance_mode() -> bool:
+    return bool(rc_get("maintenance_mode", False))
+
+def set_maintenance_mode(on: bool) -> None:
+    rc_set("maintenance_mode", on)
+    audit(ADMIN_ID, "admin_maintenance_mode", "on" if on else "off")
+    log.info("Maintenance mode: %s", "ON" if on else "OFF")
+
+
+# ── Registration lock ────────────────────────────────────────
+def is_registration_locked() -> bool:
+    return bool(rc_get("registration_locked", False))
+
+def set_registration_lock(locked: bool) -> None:
+    rc_set("registration_locked", locked)
+    audit(ADMIN_ID, "admin_registration_lock", "locked" if locked else "unlocked")
+
+
+# ── Account cap per user ─────────────────────────────────────
+def get_account_cap() -> int:
+    return int(rc_get("account_cap", 0))  # 0 = no limit
+
+def set_account_cap(cap: int) -> None:
+    rc_set("account_cap", cap)
+    audit(ADMIN_ID, "admin_account_cap", str(cap))
+
+
+# ── Scheduled broadcast ──────────────────────────────────────
+_scheduled_broadcasts: dict[str, asyncio.Task] = {}
+
+def db_save_scheduled_broadcast(broadcast_id: str, message: str, run_at: datetime) -> None:
+    _db["scheduled_broadcasts"].update_one(
+        {"broadcast_id": broadcast_id},
+        {"$set": {
+            "broadcast_id": broadcast_id,
+            "message": message,
+            "run_at": run_at,
+            "status": "pending",
+            "created": datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
+
+def db_get_scheduled_broadcasts() -> list:
+    return list(_db["scheduled_broadcasts"].find(
+        {"status": "pending"},
+        {"_id": 0}
+    ).sort("run_at", 1))
+
+def db_cancel_scheduled_broadcast(broadcast_id: str) -> None:
+    _db["scheduled_broadcasts"].update_one(
+        {"broadcast_id": broadcast_id},
+        {"$set": {"status": "cancelled"}},
+    )
+
+
+async def _run_scheduled_broadcast(broadcast_id: str, message: str, delay: float) -> None:
+    """Sleep then send a broadcast."""
+    await asyncio.sleep(delay)
+    db_cancel_scheduled_broadcast(broadcast_id)  # mark done
+    users = list(col_users.find({}, {"uid": 1}))
+    sent = failed = blocked = 0
+    for u in users:
+        try:
+            await _bot_ref.send_message(
+                u["uid"],
+                f"📢 *Scheduled Announcement*\n\n{message}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            sent += 1
+        except TelegramError as e:
+            err = str(e).lower()
+            if any(x in err for x in ("blocked", "deactivated", "not found", "forbidden")):
+                blocked += 1
+            else:
+                failed += 1
+        await asyncio.sleep(0.05)
+    audit(ADMIN_ID, "admin_scheduled_broadcast_done", f"id={broadcast_id} sent={sent}")
+    try:
+        await _bot_ref.send_message(
+            ADMIN_ID,
+            f"📢 *Scheduled broadcast done*\n• Sent: `{sent}`\n• Blocked: `{blocked}`\n• Errors: `{failed}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except TelegramError:
+        pass
+
+
+# ── Admin notes on users ─────────────────────────────────────
+def db_set_admin_note(target_uid: int, note: str) -> None:
+    col_users.update_one(
+        {"uid": target_uid},
+        {"$set": {"admin_note": note, "admin_note_at": datetime.now(timezone.utc)}},
+    )
+
+def db_get_admin_note(target_uid: int) -> Optional[str]:
+    doc = col_users.find_one({"uid": target_uid}, {"admin_note": 1})
+    return (doc or {}).get("admin_note")
+
+
+# ── User activity heatmap data ───────────────────────────────
+def db_activity_heatmap(days: int = 30) -> list:
+    """Returns per-day action counts for the last N days."""
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    pipe = [
+        {"$match": {"ts": {"$gte": since}}},
+        {"$group": {
+            "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$ts"}},
+            "count": {"$sum": 1},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+    return list(col_audit.aggregate(pipe))
+
+
+# ── Growth metrics ───────────────────────────────────────────
+def db_growth_metrics() -> dict:
+    """Returns new users per day for the last 14 days."""
+    since = datetime.now(timezone.utc) - timedelta(days=14)
+    pipe = [
+        {"$match": {"joined": {"$gte": since}}},
+        {"$group": {
+            "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$joined"}},
+            "count": {"$sum": 1},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+    return {r["_id"]: r["count"] for r in col_users.aggregate(pipe)}
+
+
+# ── Admin notes keyboard ─────────────────────────────────────
+def ikb_admin_user_actions_v2(target_uid: int, banned: bool) -> InlineKeyboardMarkup:
+    """Extended user action keyboard with note + whitelist buttons."""
+    ban_label = "✅ Unban" if banned else "🚫 Ban"
+    ban_cb    = f"ADMIN_UNBAN:{target_uid}" if banned else f"ADMIN_BAN:{target_uid}"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(ban_label,             callback_data=ban_cb),
+            InlineKeyboardButton("🗑 Delete All Data",   callback_data=f"ADMIN_DEL_USER:{target_uid}"),
+        ],
+        [
+            InlineKeyboardButton("🔒 Force Lock",       callback_data=f"ADMIN_LOCK:{target_uid}"),
+            InlineKeyboardButton("💬 Send Message",      callback_data=f"ADMIN_MSG:{target_uid}"),
+        ],
+        [
+            InlineKeyboardButton("📋 Audit Trail",      callback_data=f"ADMIN_AUDIT:{target_uid}"),
+            InlineKeyboardButton("📊 User Stats",        callback_data=f"ADMIN_USTATS:{target_uid}"),
+        ],
+        [
+            InlineKeyboardButton("👤 Login as User",    callback_data=f"ADMIN_IMPERSONATE:{target_uid}"),
+            InlineKeyboardButton("📝 Add Note",          callback_data=f"ADMIN_NOTE:{target_uid}"),
+        ],
+        [
+            InlineKeyboardButton("🔓 Force Unlock",     callback_data=f"ADMIN_FORCEUNLOCK:{target_uid}"),
+            InlineKeyboardButton("📤 Export User Data",  callback_data=f"ADMIN_EXPORTUSER:{target_uid}"),
+        ],
+    ])
+
+
+# Replace the original so all existing callers get the extended buttons
+ikb_admin_user_actions = ikb_admin_user_actions_v2
+
+
+# ── Advanced admin keyboards ─────────────────────────────────
+def rkb_admin_v2() -> ReplyKeyboardMarkup:
+    """Extended admin panel keyboard with all advanced features."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("👥 Users"),            KeyboardButton("📊 Global Stats")],
+            [KeyboardButton("📋 Audit Log"),         KeyboardButton("🔔 Pending Resets")],
+            [KeyboardButton("📢 Broadcast"),          KeyboardButton("🗓 Schedule Broadcast")],
+            [KeyboardButton("🔍 User Lookup"),        KeyboardButton("🔎 Search Accounts")],
+            [KeyboardButton("🚫 Ban User"),           KeyboardButton("✅ Unban User")],
+            [KeyboardButton("🗑 Delete User"),        KeyboardButton("💬 Message User")],
+            [KeyboardButton("🔒 Force Lock User"),    KeyboardButton("📤 Export All Logs")],
+            [KeyboardButton("👤 Login as User"),      KeyboardButton("⚙️ Bot Config")],
+            [KeyboardButton("🛡 Security Center"),    KeyboardButton("📈 Growth Stats")],
+            [KeyboardButton("🔧 Runtime Settings"),   KeyboardButton("📊 Activity Heatmap")],
+            [KeyboardButton("📋 Scheduled Broadcasts"),KeyboardButton("🔄 Bot Health")],
+            [KeyboardButton("🏠 Home")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+# ── Advanced admin: security center ─────────────────────────
+@admin_only
+async def _admin_security_center(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show security overview: suspicious activity, multiple fails, etc."""
+    now = datetime.now(timezone.utc)
+    since_1h = now - timedelta(hours=1)
+    since_24h = now - timedelta(hours=24)
+
+    # Failed PIN attempts in last 24h
+    pin_fails_pipe = [
+        {"$match": {"action": "pin_fail", "ts": {"$gte": since_24h}}},
+        {"$group": {"_id": "$uid", "count": {"$sum": 1}}},
+        {"$match": {"count": {"$gte": 3}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 10},
+    ]
+    pin_fail_users = list(col_audit.aggregate(pin_fails_pipe))
+
+    # Rapid OTP generation (possible abuse)
+    otp_pipe = [
+        {"$match": {"action": {"$in": ["otp_get", "otp_copy"]}, "ts": {"$gte": since_1h}}},
+        {"$group": {"_id": "$uid", "count": {"$sum": 1}}},
+        {"$match": {"count": {"$gte": 20}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 5},
+    ]
+    otp_abuse = list(col_audit.aggregate(otp_pipe))
+
+    # Export events in last 24h
+    export_count = col_audit.count_documents({"action": "export", "ts": {"$gte": since_24h}})
+
+    # New accounts with no activity (potential bots)
+    phantom_count = col_users.count_documents({
+        "joined": {"$gte": now - timedelta(days=7)},
+        "last_seen": {"$exists": False},
+    })
+
+    lines = []
+    if pin_fail_users:
+        lines.append("*🔑 High PIN Fail Rate (24h):*")
+        for r in pin_fail_users:
+            doc = col_users.find_one({"uid": r["_id"]}, {"name": 1}) or {}
+            lines.append(f"  `{r['_id']}` {doc.get('name','?')[:12]} — {r['count']} fails")
+    if otp_abuse:
+        lines.append("\n*⚡ Rapid OTP Generation (1h):*")
+        for r in otp_abuse:
+            doc = col_users.find_one({"uid": r["_id"]}, {"name": 1}) or {}
+            lines.append(f"  `{r['_id']}` {doc.get('name','?')[:12]} — {r['count']} OTPs")
+
+    summary = (
+        f"🛡 *Security Center*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 Users with 3+ PIN fails (24h) : `{len(pin_fail_users)}`\n"
+        f"⚡ OTP abuse suspects (1h)       : `{len(otp_abuse)}`\n"
+        f"📤 Export events (24h)           : `{export_count}`\n"
+        f"👻 Phantom accounts (7d)         : `{phantom_count}`\n"
+    )
+    if lines:
+        summary += "\n" + "\n".join(lines)
+    else:
+        summary += "\n✅ _No anomalies detected._"
+
+    await update.effective_chat.send_message(
+        summary, parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_back(),
+    )
+
+
+# ── Advanced admin: growth stats ─────────────────────────────
+@admin_only
+async def _admin_growth_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show user growth over time."""
+    growth = db_growth_metrics()
+    now    = datetime.now(timezone.utc)
+
+    # Retention: users active in last 7d vs total
+    active_7d  = col_sessions.count_documents({
+        "last": {"$gte": now - timedelta(days=7)},
+    })
+    total      = col_users.count_documents({})
+    retention  = f"{100 * active_7d // total}%" if total else "N/A"
+
+    # Accounts per user distribution
+    pipe = [
+        {"$group": {"_id": "$uid", "count": {"$sum": 1}}},
+        {"$group": {"_id": None, "avg": {"$avg": "$count"}, "max": {"$max": "$count"}}},
+    ]
+    agg  = list(col_accounts.aggregate(pipe))
+    avg_accts = round(agg[0]["avg"], 1) if agg else 0
+    max_accts = agg[0]["max"]           if agg else 0
+
+    if growth:
+        bar_lines = []
+        max_count = max(growth.values()) or 1
+        for date, count in list(growth.items())[-14:]:
+            bar_len = int(12 * count / max_count)
+            bar     = "█" * bar_len + "░" * (12 - bar_len)
+            bar_lines.append(f"`{date[5:]}` {bar} `{count}`")
+        chart = "\n".join(bar_lines)
+    else:
+        chart = "_No data_"
+
+    await update.effective_chat.send_message(
+        f"📈 *Growth Stats (14d)*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Total users          : `{total}`\n"
+        f"🔄 Active last 7d       : `{active_7d}` ({retention} retention)\n"
+        f"🔐 Avg accounts/user    : `{avg_accts}`\n"
+        f"🏆 Max accounts (1 user): `{max_accts}`\n\n"
+        f"*New users per day:*\n{chart}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_back(),
+    )
+
+
+# ── Advanced admin: activity heatmap ─────────────────────────
+@admin_only
+async def _admin_activity_heatmap(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show audit event activity per day for last 30 days as ASCII chart."""
+    rows = db_activity_heatmap(30)
+    if not rows:
+        await update.effective_chat.send_message(
+            "📊 No activity data.", reply_markup=rkb_admin_back()
+        )
+        return
+    max_count = max(r["count"] for r in rows) or 1
+    lines     = []
+    for r in rows:
+        bar_len = int(15 * r["count"] / max_count)
+        bar     = "█" * bar_len + "░" * (15 - bar_len)
+        lines.append(f"`{r['_id'][5:]}` {bar} `{r['count']}`")
+    await update.effective_chat.send_message(
+        f"📊 *Activity Heatmap (30d)*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_back(),
+    )
+
+
+# ── Advanced admin: runtime settings ─────────────────────────
+@admin_only
+async def _admin_runtime_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show toggleable runtime settings panel."""
+    maint = is_maintenance_mode()
+    reg_locked = is_registration_locked()
+    cap = get_account_cap()
+    await update.effective_chat.send_message(
+        f"🔧 *Runtime Settings*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🚧 Maintenance mode   : {'🟢 ON' if maint else '⚫ OFF'}\n"
+        f"🔒 Registration lock  : {'🟢 LOCKED' if reg_locked else '⚫ OPEN'}\n"
+        f"📦 Account cap/user   : `{'No limit' if not cap else cap}`\n\n"
+        f"_Use the buttons below to toggle settings._",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ikb_runtime_settings(maint, reg_locked, cap),
+    )
+
+
+def ikb_runtime_settings(maint: bool, reg_locked: bool, cap: int) -> InlineKeyboardMarkup:
+    maint_label = "🔴 Disable Maintenance" if maint else "🟢 Enable Maintenance"
+    reg_label   = "🔓 Unlock Registration" if reg_locked else "🔒 Lock Registration"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(maint_label,        callback_data="ADMIN_RT_MAINT_TOGGLE")],
+        [InlineKeyboardButton(reg_label,          callback_data="ADMIN_RT_REG_TOGGLE")],
+        [InlineKeyboardButton("📦 Set Account Cap", callback_data="ADMIN_RT_CAP_SET")],
+        [InlineKeyboardButton("❌ Close",           callback_data="ADMIN_CANCEL")],
+    ])
+
+
+# ── Advanced admin: bot health ────────────────────────────────
+@admin_only
+async def _admin_bot_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show bot runtime health: uptime, DB stats, memory."""
+    import sys
+    try:
+        import psutil
+        proc   = psutil.Process()
+        mem_mb = proc.memory_info().rss / 1024 / 1024
+        cpu    = proc.cpu_percent(interval=0.2)
+        mem_str = f"`{mem_mb:.1f} MB`"
+        cpu_str = f"`{cpu:.1f}%`"
+    except ImportError:
+        mem_str = "_psutil not installed_"
+        cpu_str = "_psutil not installed_"
+
+    # DB collection sizes
+    def col_info(col_name):
+        try:
+            stats = _db.command("collstats", col_name)
+            count = stats.get("count", 0)
+            size  = stats.get("storageSize", 0) // 1024
+            return f"`{count}` docs / `{size}` KB"
+        except Exception:
+            return "_unavailable_"
+
+    now    = datetime.now(timezone.utc)
+    maint  = is_maintenance_mode()
+    reg_ok = not is_registration_locked()
+
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+
+    await update.effective_chat.send_message(
+        f"🔄 *Bot Health*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🐍 Python        : `{py_ver}`\n"
+        f"💾 Memory        : {mem_str}\n"
+        f"⚙️ CPU            : {cpu_str}\n"
+        f"🛢 users         : {col_info('users')}\n"
+        f"🛢 otp_accounts  : {col_info('otp_accounts')}\n"
+        f"🛢 sessions      : {col_info('sessions')}\n"
+        f"🛢 audit_log     : {col_info('audit_log')}\n"
+        f"🚧 Maintenance   : {'🟢 ON' if maint else '⚫ OFF'}\n"
+        f"🔒 Registration  : {'🔒 LOCKED' if not reg_ok else '🔓 OPEN'}\n"
+        f"🕐 Server time   : `{now.strftime('%Y-%m-%d %H:%M UTC')}`\n"
+        f"🔑 Admin sessions: `{len(_session_cache)}`\n"
+        f"⏳ Auto-lock tasks: `{len(_auto_lock_tasks)}`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_back(),
+    )
+
+
+# ── Advanced admin: search accounts globally ─────────────────
+@admin_only
+async def _admin_search_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"]      = "ADMIN_WAIT_ACCT_SEARCH"
+    ctx.user_data["admin_mode"] = True
+    await update.effective_chat.send_message(
+        "🔎 *Global Account Search*\n\nSend a service name or keyword to search across ALL users' accounts.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_cancel(),
+    )
+
+
+async def _admin_do_account_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str) -> None:
+    regex  = re.compile(re.escape(query), re.IGNORECASE)
+    docs   = list(col_accounts.find(
+        {"$or": [{"svc": regex}, {"issuer": regex}]},
+        {"uid": 1, "svc": 1, "issuer": 1, "created": 1, "_id": 0},
+    ).limit(20))
+    if not docs:
+        await update.effective_chat.send_message(
+            f"🔎 No accounts found matching `{query}`.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_back(),
+        )
+        return
+    lines = []
+    for d in docs:
+        user_doc = col_users.find_one({"uid": d["uid"]}, {"name": 1}) or {}
+        lines.append(
+            f"🔐 `{d['svc']}` · `{d.get('issuer','')[:12]}` — uid:`{d['uid']}` ({user_doc.get('name','?')[:10]})"
+        )
+    await update.effective_chat.send_message(
+        f"🔎 *Search results for* `{query}` *(top {len(docs)})*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin_back(),
+    )
+
+
+# ── Advanced admin: schedule broadcast ──────────────────────
+@admin_only
+async def _admin_start_schedule_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"]      = "ADMIN_WAIT_SCHED_MSG"
+    ctx.user_data["admin_mode"] = True
+    await update.effective_chat.send_message(
+        "🗓 *Schedule Broadcast*\n\n"
+        "Step 1 of 2 — Send the message text to broadcast.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_cancel(),
+    )
+
+
+# ── Advanced admin: view scheduled broadcasts ────────────────
+@admin_only
+async def _admin_view_scheduled(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    rows = db_get_scheduled_broadcasts()
+    if not rows:
+        await update.effective_chat.send_message(
+            "🗓 No scheduled broadcasts.",
+            reply_markup=rkb_admin_back(),
+        )
+        return
+    lines = []
+    for r in rows:
+        run_at = r["run_at"].strftime("%m-%d %H:%M UTC") if isinstance(r.get("run_at"), datetime) else "?"
+        msg_preview = r.get("message", "")[:40] + ("…" if len(r.get("message","")) > 40 else "")
+        lines.append(f"🗓 `{run_at}` — {msg_preview}\n  ID: `{r['broadcast_id'][:8]}`")
+    ikb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"❌ Cancel {r['broadcast_id'][:8]}", callback_data=f"ADMIN_SCHED_CANCEL:{r['broadcast_id']}")]
+        for r in rows[:5]
+    ])
+    await update.effective_chat.send_message(
+        f"🗓 *Scheduled Broadcasts* ({len(rows)})\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ikb,
+    )
+
+
+# ── Advanced admin: export single user data ──────────────────
+async def _admin_export_user_data(q, target_uid: int) -> None:
+    """Export all data for a single user as a JSON file."""
+    user_doc  = col_users.find_one({"uid": target_uid}, {"_id": 0, "pin_hash": 0, "security_answers_enc": 0}) or {}
+    accts     = list(col_accounts.find({"uid": target_uid}, {"_id": 0, "enc": 0}))
+    audit_log = list(col_audit.find({"uid": target_uid}, {"_id": 0}).sort("ts", -1).limit(200))
+
+    # Serialize datetimes
+    def _ser(obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        raise TypeError
+
+    payload = {
+        "user": user_doc,
+        "accounts": [
+            {k: (_ser(v) if isinstance(v, datetime) else v) for k, v in a.items()}
+            for a in accts
+        ],
+        "audit_log": [
+            {k: (_ser(v) if isinstance(v, datetime) else v) for k, v in r.items()}
+            for r in audit_log
+        ],
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+    }
+    bio  = io.BytesIO(json.dumps(payload, indent=2, default=str).encode())
+    bio.name = f"nexauth_user_{target_uid}_{datetime.now(timezone.utc).strftime('%Y%m%d')}.json"
+    try:
+        await q.bot.send_document(
+            chat_id=ADMIN_ID,
+            document=bio,
+            caption=f"📤 *User data export for* `{target_uid}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        audit(ADMIN_ID, "admin_export_user", str(target_uid))
+    except TelegramError as e:
+        await q.message.reply_text(f"❌ Export failed: {e}")
+
+
+# ── Advanced admin: force-unlock user ────────────────────────
+async def _admin_force_unlock(q, target_uid: int) -> None:
+    """Open a session for a user without a PIN check."""
+    session_touch(target_uid)
+    audit(target_uid, "admin_force_unlock", str(ADMIN_ID))
+    await q.message.reply_text(
+        f"🔓 *User `{target_uid}` session force-unlocked.*\nThey can now access their vault.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        await q.bot.send_message(
+            chat_id=target_uid,
+            text="🔓 *Your vault has been unlocked by the admin.*\nYou can now access your accounts.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_home(),
+        )
+    except TelegramError:
+        pass
+
+
+# ── Patch _handle_admin_message to include new features ──────
+_orig_handle_admin_message = _handle_admin_message
+
+async def _handle_admin_message_v2(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                    uid: int, text: str, state: str) -> bool:
+    """
+    Extended admin message handler.
+    Calls the original handler first, then handles new advanced features.
+    """
+    # Handle new admin panel navigation first (before original, to switch keyboard)
+    if uid != ADMIN_ID:
+        return False
+
+    # Upgrade keyboard: switch to v2 admin keyboard when returning to panel
+    if text == "🔙 Admin Panel":
+        ctx.user_data.clear()
+        ctx.user_data["admin_mode"] = True
+        stats = db_global_stats()
+        maint = "⚠️ MAINTENANCE ON" if is_maintenance_mode() else ""
+        await update.effective_chat.send_message(
+            "🛡 *Admin Panel v2*\n"
+            f"👥 `{stats['total_users']}` users · 🔐 `{stats['total_accounts']}` accounts · "
+            f"🔔 `{stats['pending_resets']}` pending resets"
+            + (f"\n\n{maint}" if maint else ""),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin_v2(),
+        )
+        return True
+
+    # New advanced features
+    if text == "🛡 Security Center":
+        await _admin_security_center(update, ctx)
+        return True
+    if text == "📈 Growth Stats":
+        await _admin_growth_stats(update, ctx)
+        return True
+    if text == "📊 Activity Heatmap":
+        await _admin_activity_heatmap(update, ctx)
+        return True
+    if text == "🔧 Runtime Settings":
+        await _admin_runtime_settings(update, ctx)
+        return True
+    if text == "🔄 Bot Health":
+        await _admin_bot_health(update, ctx)
+        return True
+    if text == "🔎 Search Accounts":
+        await _admin_search_accounts(update, ctx)
+        return True
+    if text == "🗓 Schedule Broadcast":
+        await _admin_start_schedule_broadcast(update, ctx)
+        return True
+    if text == "📋 Scheduled Broadcasts":
+        await _admin_view_scheduled(update, ctx)
+        return True
+
+    # New wait states
+    if state == "ADMIN_WAIT_ACCT_SEARCH":
+        ctx.user_data.pop("state", None)
+        await _admin_do_account_search(update, ctx, text.strip())
+        return True
+
+    if state == "ADMIN_WAIT_SCHED_MSG":
+        ctx.user_data["sched_msg"]  = text
+        ctx.user_data["state"]      = "ADMIN_WAIT_SCHED_TIME"
+        await update.effective_chat.send_message(
+            "🗓 *Schedule Broadcast*\n\n"
+            "Step 2 of 2 — In how many minutes should it be sent?\n"
+            "_(Send a number, e.g. `60` for 1 hour from now)_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin_cancel(),
+        )
+        return True
+
+    if state == "ADMIN_WAIT_SCHED_TIME":
+        ctx.user_data.pop("state", None)
+        msg_text = ctx.user_data.pop("sched_msg", "")
+        try:
+            minutes = int(text.strip())
+            if minutes < 1 or minutes > 10080:  # 1 min to 1 week
+                raise ValueError
+        except ValueError:
+            await update.effective_chat.send_message(
+                "❌ Invalid time. Send a number of minutes (1–10080).",
+                reply_markup=rkb_admin_back(),
+            )
+            return True
+        broadcast_id = base64.urlsafe_b64encode(os.urandom(6)).decode().rstrip("=")
+        run_at       = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        db_save_scheduled_broadcast(broadcast_id, msg_text, run_at)
+        delay        = minutes * 60.0
+        task         = asyncio.ensure_future(_run_scheduled_broadcast(broadcast_id, msg_text, delay))
+        _scheduled_broadcasts[broadcast_id] = task
+        audit(ADMIN_ID, "admin_schedule_broadcast", f"id={broadcast_id} delay={minutes}m")
+        await update.effective_chat.send_message(
+            f"✅ *Broadcast scheduled!*\n"
+            f"🗓 Fires in `{minutes}` minute(s) at `{run_at.strftime('%H:%M UTC')}`\n"
+            f"ID: `{broadcast_id[:8]}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin_back(),
+        )
+        return True
+
+    if state == "ADMIN_WAIT_NOTE":
+        ctx.user_data.pop("state", None)
+        note_uid = ctx.user_data.pop("admin_note_uid", None)
+        if note_uid:
+            db_set_admin_note(note_uid, text.strip())
+            audit(ADMIN_ID, "admin_note", f"uid={note_uid}")
+            await update.effective_chat.send_message(
+                f"📝 *Note saved for* `{note_uid}`.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_admin_back(),
+            )
+        return True
+
+    if state == "ADMIN_WAIT_CAP":
+        ctx.user_data.pop("state", None)
+        try:
+            cap = int(text.strip())
+            if cap < 0:
+                raise ValueError
+        except ValueError:
+            await update.effective_chat.send_message(
+                "❌ Invalid cap. Send a non-negative integer (0 = no limit).",
+                reply_markup=rkb_admin_back(),
+            )
+            return True
+        set_account_cap(cap)
+        await update.effective_chat.send_message(
+            f"✅ Account cap set to `{'No limit' if not cap else cap}`.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin_back(),
+        )
+        return True
+
+    # Fall through to original handler
+    return await _orig_handle_admin_message(update, ctx, uid, text, state)
+
+
+# Monkey-patch so on_message uses the extended handler
+_handle_admin_message = _handle_admin_message_v2
+
+
+# ── Patch admin inline callback handler for new buttons ──────
+_orig_handle_admin_callback = _handle_admin_callback  # noqa: F821 (defined earlier in file)
+
+async def _handle_admin_callback_v2(q, ctx: ContextTypes.DEFAULT_TYPE, uid: int, data: str) -> bool:
+    """Extended admin callback handler."""
+    if uid != ADMIN_ID:
+        return False
+
+    if data.startswith("ADMIN_NOTE:"):
+        target_uid = int(data.split(":", 1)[1])
+        ctx.user_data["state"]          = "ADMIN_WAIT_NOTE"
+        ctx.user_data["admin_note_uid"] = target_uid
+        ctx.user_data["admin_mode"]     = True
+        existing = db_get_admin_note(target_uid)
+        note_info = f"\n_Current note: {existing}_" if existing else ""
+        await q.message.reply_text(
+            f"📝 *Add/Update Note for* `{target_uid}`{note_info}\n\nSend the note text.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin_cancel(),
+        )
+        return True
+
+    if data.startswith("ADMIN_FORCEUNLOCK:"):
+        target_uid = int(data.split(":", 1)[1])
+        await _admin_force_unlock(q, target_uid)
+        return True
+
+    if data.startswith("ADMIN_EXPORTUSER:"):
+        target_uid = int(data.split(":", 1)[1])
+        await _admin_export_user_data(q, target_uid)
+        return True
+
+    if data == "ADMIN_RT_MAINT_TOGGLE":
+        new_val = not is_maintenance_mode()
+        set_maintenance_mode(new_val)
+        reg_locked = is_registration_locked()
+        cap        = get_account_cap()
+        try:
+            await q.edit_message_reply_markup(
+                reply_markup=ikb_runtime_settings(new_val, reg_locked, cap)
+            )
+        except (BadRequest, TelegramError):
+            pass
+        await q.message.reply_text(
+            f"🚧 Maintenance mode: *{'ON' if new_val else 'OFF'}*",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+
+    if data == "ADMIN_RT_REG_TOGGLE":
+        new_val = not is_registration_locked()
+        set_registration_lock(new_val)
+        maint = is_maintenance_mode()
+        cap   = get_account_cap()
+        try:
+            await q.edit_message_reply_markup(
+                reply_markup=ikb_runtime_settings(maint, new_val, cap)
+            )
+        except (BadRequest, TelegramError):
+            pass
+        await q.message.reply_text(
+            f"🔒 Registration: *{'LOCKED' if new_val else 'OPEN'}*",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+
+    if data == "ADMIN_RT_CAP_SET":
+        ctx.user_data["state"]      = "ADMIN_WAIT_CAP"
+        ctx.user_data["admin_mode"] = True
+        await q.message.reply_text(
+            f"📦 *Set Account Cap*\n\n"
+            f"Current: `{'No limit' if not get_account_cap() else get_account_cap()}`\n\n"
+            "Send the new cap (number of max accounts per user, 0 = no limit).",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin_cancel(),
+        )
+        return True
+
+    if data.startswith("ADMIN_SCHED_CANCEL:"):
+        broadcast_id = data.split(":", 1)[1]
+        task = _scheduled_broadcasts.pop(broadcast_id, None)
+        if task and not task.done():
+            task.cancel()
+        db_cancel_scheduled_broadcast(broadcast_id)
+        audit(ADMIN_ID, "admin_sched_cancel", broadcast_id[:8])
+        await q.message.reply_text(
+            f"❌ Scheduled broadcast `{broadcast_id[:8]}` cancelled.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+
+    # Fall through to original
+    return await _orig_handle_admin_callback(q, ctx, uid, data)
+
+
+# Monkey-patch the admin callback handler
+_handle_admin_callback = _handle_admin_callback_v2
+
+
+# ── Upgrade /admin command to show v2 panel ──────────────────
+@admin_only
+async def cmd_admin_v2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data.clear()
+    ctx.user_data["admin_mode"] = True
+    stats = db_global_stats()
+    maint_warn = "\n\n⚠️ *MAINTENANCE MODE IS ON*" if is_maintenance_mode() else ""
+    reg_warn   = "\n🔒 *Registration LOCKED*" if is_registration_locked() else ""
+    cap        = get_account_cap()
+    cap_str    = f"\n📦 Account cap: `{cap}`" if cap else ""
+    await update.message.reply_text(
+        "🛡 *NexAuth Admin Panel v2*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Users        : `{stats['total_users']}`  _(+{stats['new_users_24h']} today)_\n"
+        f"🔐 Accounts     : `{stats['total_accounts']}`\n"
+        f"🔓 Sessions     : `{stats['active_sessions']}`\n"
+        f"🚫 Banned       : `{stats['banned_users']}`\n"
+        f"🔔 Pending resets: `{stats['pending_resets']}`\n"
+        f"📋 Actions 24h  : `{stats['audit_24h']}`\n"
+        f"📋 Actions 7d   : `{stats['audit_7d']}`"
+        + maint_warn + reg_warn + cap_str +
+        "\n\nUse the panel below to manage the bot.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_admin_v2(),
+    )
+
+
+# ── Maintenance mode guard (inject into cmd_start / on_message)
+async def _maintenance_guard(update: Update, uid: int) -> bool:
+    """Returns True if user should be blocked due to maintenance mode."""
+    if uid == ADMIN_ID:
+        return False  # admin always allowed
+    if is_maintenance_mode():
+        try:
+            await update.effective_chat.send_message(
+                "🚧 *NexAuth is currently under maintenance.*\n\n"
+                "We'll be back shortly. Thank you for your patience!",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except TelegramError:
+            pass
+        return True
+    return False
+
+
+# ── Registration lock guard ──────────────────────────────────
+async def _registration_guard(update: Update, uid: int) -> bool:
+    """Returns True if user tried to register but registration is locked."""
+    if uid == ADMIN_ID:
+        return False
+    if is_registration_locked():
+        existing = col_users.find_one({"uid": uid})
+        if not existing:
+            try:
+                await update.effective_chat.send_message(
+                    "🔒 *New registrations are temporarily closed.*\n\n"
+                    "Please check back later.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except TelegramError:
+                pass
+            return True
+    return False
+
+
+# ── Account cap guard ────────────────────────────────────────
+def _account_cap_guard(uid: int) -> bool:
+    """Returns True if user has hit the account cap."""
+    cap = get_account_cap()
+    if not cap:
+        return False
+    count = col_accounts.count_documents({"uid": uid})
+    return count >= cap
+
+
+# ─────────────────────────────────────────────────────────────
+# 26.  MAIN
 # ─────────────────────────────────────────────────────────────
 def main() -> None:
     global _bot_ref
@@ -5446,7 +6331,8 @@ def main() -> None:
     app.add_handler(CommandHandler("digest",       cmd_digest))
     app.add_handler(CommandHandler("broadcast",    cmd_broadcast))
     app.add_handler(CommandHandler("admin_stats",  cmd_admin_stats))
-    app.add_handler(CommandHandler("admin",        cmd_admin))
+    # Use upgraded admin command
+    app.add_handler(CommandHandler("admin",        cmd_admin_v2))
     app.add_handler(MessageHandler(
         filters.Regex(r"^/resetreview_") & filters.TEXT,
         cmd_resetreview,
@@ -5459,7 +6345,7 @@ def main() -> None:
     # Watchdog: cleanup-only pass every 10s (actual auto-lock is per-user via _auto_lock_user)
     app.job_queue.run_repeating(watchdog, interval=10, first=5)
 
-    log.info("NexAuth v5 started — polling.")
+    log.info("NexAuth v6 (Advanced Admin) started — polling.")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
