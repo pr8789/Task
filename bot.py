@@ -414,7 +414,16 @@ def db_delete_reset_request(request_id: str) -> None:
 # ─────────────────────────────────────────────────────────────
 # 4.  SESSION
 # ─────────────────────────────────────────────────────────────
-_session_cache: dict = {}
+
+# In-memory cache: uid → datetime (UTC) of last touch.
+# Using wall-clock datetime (not monotonic) so the cache stays
+# correct across process restarts and bot_data reloads.
+_session_cache: dict[int, datetime] = {}
+
+# Per-user auto-lock tasks: uid → asyncio.Task
+# Each task sleeps for SESSION_TTL then fires the lock notification.
+# Replaced every time session_touch() is called.
+_auto_lock_tasks: dict[int, "asyncio.Task[None]"] = {}
 
 # Tracks active admin-reminder tasks for reset requests: request_id → asyncio.Task
 _reset_reminder_tasks: dict[str, asyncio.Task] = {}
@@ -422,20 +431,87 @@ _reset_reminder_tasks: dict[str, asyncio.Task] = {}
 # Tracks the current admin notification message_id for each request: request_id → int
 _reset_admin_msg_ids: dict[str, int] = {}
 
+# Forward reference — filled in main() after the Application is built
+_bot_ref = None
+
 
 def session_touch(uid: int) -> None:
-    _session_cache[uid] = time.monotonic()
+    """Record activity for uid. Resets the inactivity timer."""
+    now = datetime.now(timezone.utc)
+    _session_cache[uid] = now
     col_sessions.update_one(
         {"uid": uid},
-        {"$set": {"last": datetime.now(timezone.utc)}},
+        {"$set": {"last": now}},
         upsert=True,
     )
+    # Reschedule per-user auto-lock: cancel old task, spawn fresh one
+    old = _auto_lock_tasks.pop(uid, None)
+    if old and not old.done():
+        old.cancel()
+    task = asyncio.ensure_future(_auto_lock_user(uid))
+    _auto_lock_tasks[uid] = task
+
+
+async def _auto_lock_user(uid: int) -> None:
+    """Sleep for SESSION_TTL then lock the user and send a notification."""
+    try:
+        await asyncio.sleep(SESSION_TTL)
+    except asyncio.CancelledError:
+        return  # session_touch() rescheduled us — do nothing
+
+    # Confirm session is truly expired (clock check, not cache)
+    doc = col_sessions.find_one({"uid": uid})
+    if doc:
+        last = doc["last"]
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+        if elapsed < SESSION_TTL:
+            # A concurrent touch happened — bail out, the new task will handle it
+            return
+
+    # Kill the session
+    _session_cache.pop(uid, None)
+    _auto_lock_tasks.pop(uid, None)
+    col_sessions.delete_one({"uid": uid})
+
+    # Only notify if the user actually has a PIN (no-PIN users have no lock screen)
+    pin_hash = db_get_pin(uid)
+    if not pin_hash:
+        return
+
+    bot = _bot_ref
+    if bot is None:
+        return
+    try:
+        await bot.send_message(
+            chat_id=uid,
+            text=(
+                "🔒 *Vault Auto-Locked*\n\n"
+                f"Your session expired after *{SESSION_TTL // 60} min* of inactivity.\n\n"
+                "🛡 *Your OTP secrets are protected.*\n"
+                "Tap *🔓 Unlock Vault* and enter your passcode to continue."
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_unlock(),
+        )
+        log.info("Auto-lock: sent lock notification to uid=%s", uid)
+    except TelegramError as te:
+        log.warning("Auto-lock: could not notify uid=%s — %s", uid, te)
 
 
 def session_alive(uid: int) -> bool:
-    t = _session_cache.get(uid)
-    if t and (time.monotonic() - t) < SESSION_TTL:
-        return True
+    """Return True if uid has an unexpired session."""
+    # 1. Fast in-memory check (datetime-based, survives restarts correctly)
+    cached = _session_cache.get(uid)
+    if cached is not None:
+        if (datetime.now(timezone.utc) - cached).total_seconds() < SESSION_TTL:
+            return True
+        else:
+            # Cache says expired — evict and fall through to DB check
+            _session_cache.pop(uid, None)
+
+    # 2. DB check (authoritative)
     doc = col_sessions.find_one({"uid": uid})
     if not doc:
         return False
@@ -444,15 +520,19 @@ def session_alive(uid: int) -> bool:
         last = last.replace(tzinfo=timezone.utc)
     alive = (datetime.now(timezone.utc) - last).total_seconds() < SESSION_TTL
     if alive:
-        _session_cache[uid] = time.monotonic()
+        _session_cache[uid] = last   # warm the cache from DB
     else:
-        _session_cache.pop(uid, None)
+        col_sessions.delete_one({"uid": uid})  # clean up stale row
     return alive
 
 
 def session_kill(uid: int) -> None:
+    """Immediately kill uid's session (manual lock, PIN change, etc.)."""
     _session_cache.pop(uid, None)
     col_sessions.delete_one({"uid": uid})
+    task = _auto_lock_tasks.pop(uid, None)
+    if task and not task.done():
+        task.cancel()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -626,8 +706,27 @@ def rkb_settings() -> ReplyKeyboardMarkup:
 
 
 def rkb_cancel() -> ReplyKeyboardMarkup:
+    """Cancel + Home — used for flows entered from the home screen."""
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("❌ Cancel")]],
+        [[KeyboardButton("❌ Cancel")], [KeyboardButton("🏠 Home")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def rkb_cancel_settings() -> ReplyKeyboardMarkup:
+    """Cancel + Back to Settings — used for flows entered from the settings screen."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("❌ Cancel")], [KeyboardButton("🔙 Back to Settings")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def rkb_cancel_add() -> ReplyKeyboardMarkup:
+    """Cancel + Back to Add menu — used inside the add-account flow."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("❌ Cancel")], [KeyboardButton("🔙 Back to Add Menu")]],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -1362,6 +1461,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         pin_hash = db_get_pin(uid)
         if pin_hash:
             lockout_key = f"pin_lockout_{uid}"
+            # Check in-memory lockout first (fast path)
             lockout_until = ctx.bot_data.get(lockout_key, 0)
             if time.monotonic() < lockout_until:
                 remaining = int(lockout_until - time.monotonic())
@@ -1372,6 +1472,30 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     reply_markup=rkb_unlock_with_appeal(),
                 )
                 return
+            # Also check DB-persisted lockout (survives restarts)
+            db_lockout_str = db_get_setting(uid, "pin_lockout_until", None)
+            if db_lockout_str:
+                try:
+                    db_lockout_dt = datetime.fromisoformat(db_lockout_str)
+                    if db_lockout_dt.tzinfo is None:
+                        db_lockout_dt = db_lockout_dt.replace(tzinfo=timezone.utc)
+                    remaining_s = int((db_lockout_dt - datetime.now(timezone.utc)).total_seconds())
+                    if remaining_s > 0:
+                        # Restore into bot_data so fast path works next time
+                        ctx.bot_data[lockout_key] = time.monotonic() + remaining_s
+                        await update.message.reply_text(
+                            f"🚫 *Too many wrong attempts.*\nTry again in *{remaining_s}s*.\n\n"
+                            f"_Forgot your passcode? Tap_ *🆘 Forgot Passcode? Appeal Reset* _below._",
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=rkb_unlock_with_appeal(),
+                        )
+                        return
+                    else:
+                        # Lockout expired — clear it
+                        db_set_setting(uid, "pin_lockout_until", None)
+                        db_set_setting(uid, "pin_attempts", 0)
+                except (ValueError, TypeError):
+                    pass
             ctx.user_data["state"] = "WAIT_PIN_UNLOCK"
             await update.message.reply_text(
                 "🔑 *Enter your passcode to unlock:*",
@@ -1397,8 +1521,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             pass
         pin_hash = db_get_pin(uid)
         if pin_hash and verify_pin(text, pin_hash):
+            # ── Correct PIN ──────────────────────────────────
+            # Clear attempt counters from both bot_data AND DB
             ctx.bot_data.pop(f"pin_lockout_{uid}", None)
             ctx.bot_data.pop(f"pin_attempts_{uid}", None)
+            db_set_setting(uid, "pin_attempts", 0)
+            db_set_setting(uid, "pin_lockout_until", None)
+
             session_touch(uid)
             db_record_unlock(uid)
             audit(uid, "unlock")
@@ -1427,12 +1556,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 req_id = existing_req["request_id"]
                 db_delete_reset_request(req_id)
                 audit(uid, "reset_cancelled_by_unlock")
-                # Stop the reminder loop for this request if running
                 task = _reset_reminder_tasks.pop(req_id, None)
                 if task and not task.done():
                     task.cancel()
                 _reset_admin_msg_ids.pop(req_id, None)
-                # Inform the admin the user self-resolved
                 try:
                     await ctx.bot.send_message(
                         chat_id=ADMIN_ID,
@@ -1453,22 +1580,38 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=rkb_home(),
             )
         else:
-            attempts_key = f"pin_attempts_{uid}"
-            attempts = ctx.bot_data.get(attempts_key, 0) + 1
-            ctx.bot_data[attempts_key] = attempts
+            # ── Wrong PIN ────────────────────────────────────
+            # Use DB-persisted counters so lockout survives bot restarts
+            attempts = (db_get_setting(uid, "pin_attempts", 0) or 0) + 1
+            db_set_setting(uid, "pin_attempts", attempts)
+
+            # Also keep bot_data in sync for fast in-memory reads
+            ctx.bot_data[f"pin_attempts_{uid}"] = attempts
+
+            remaining_tries = max(0, 5 - attempts)
+
             if attempts >= 5:
+                lockout_until = datetime.now(timezone.utc) + timedelta(seconds=PIN_LOCKOUT_S)
+                db_set_setting(uid, "pin_attempts", 0)
+                db_set_setting(uid, "pin_lockout_until", lockout_until.isoformat())
                 ctx.bot_data[f"pin_lockout_{uid}"] = time.monotonic() + PIN_LOCKOUT_S
-                ctx.bot_data[attempts_key] = 0
+                ctx.bot_data[f"pin_attempts_{uid}"] = 0
                 ctx.user_data.clear()
+                audit(uid, "pin_lockout")
                 await update.effective_chat.send_message(
-                    f"🚫 *Too many wrong attempts.*\nVault locked for *{PIN_LOCKOUT_S // 60} minutes*.\n\n"
+                    f"🚫 *Too many wrong attempts.*\n"
+                    f"Vault locked for *{PIN_LOCKOUT_S // 60} minutes*.\n\n"
                     f"_Forgot your passcode? Tap_ *🆘 Forgot Passcode? Appeal Reset* _below._",
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=rkb_unlock_with_appeal(),
                 )
             else:
+                # Progressive delay: 1s × attempt number (1s, 2s, 3s, 4s)
+                # Slows brute-force without being annoying on an honest typo
+                delay = attempts
+                await asyncio.sleep(delay)
                 await update.effective_chat.send_message(
-                    f"❌ *Wrong passcode.* {5 - attempts} attempt{'s' if 5-attempts!=1 else ''} left.",
+                    f"❌ *Wrong passcode.* {remaining_tries} attempt{'s' if remaining_tries != 1 else ''} left.",
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=rkb_unlock(),
                 )
@@ -2745,12 +2888,18 @@ async def _do_confirm_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         )
         return
     db_set_pin(uid, hash_pin(pending))
+    # Security: kill the session so the user must re-enter the NEW PIN immediately.
+    # This prevents an attacker who changed the PIN on an unlocked device from
+    # leaving the vault open indefinitely.
+    session_kill(uid)
+    ctx.user_data.clear()
     await update.effective_chat.send_message(
-        "✅ *Passcode set!* Vault will require this PIN to unlock.",
+        "✅ *Passcode set!*\n\n"
+        "🔒 Your vault has been locked. Please unlock it with your new passcode.",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=rkb_settings(),
+        reply_markup=rkb_unlock(),
     )
-    log.info("PIN set uid=%s", uid)
+    log.info("PIN set uid=%s — session killed, re-lock enforced", uid)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3198,63 +3347,68 @@ async def _do_stats(update: Update, uid: int) -> None:
 # 23.  SESSION WATCHDOG
 # ─────────────────────────────────────────────────────────────
 async def watchdog(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Periodic cleanup pass.
+    Auto-lock notifications are now fired per-user by _auto_lock_user() tasks
+    so the watchdog is only responsible for cleaning up stale DB rows and
+    in-memory dicts that might have been missed (e.g. after a restart).
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=SESSION_TTL)
     try:
-        # Fetch expired sessions BEFORE deleting so we can notify each user
+        # Remove any sessions that expired and whose auto-lock task never ran
+        # (e.g. bot was restarted mid-session)
         expired_docs = list(col_sessions.find({"last": {"$lt": cutoff}}, {"uid": 1}))
         if expired_docs:
             r = col_sessions.delete_many({"last": {"$lt": cutoff}})
-            log.info("Watchdog: removed %d expired session(s)", r.deleted_count)
-            # Send lock notification to each user whose session just expired
+            log.info("Watchdog: cleaned %d stale session(s)", r.deleted_count)
             for doc in expired_docs:
                 uid = doc.get("uid")
                 if not uid:
                     continue
-                _session_cache.pop(uid, None)   # evict in-memory cache too
+                _session_cache.pop(uid, None)
+                # Cancel any lingering auto-lock task for this uid
+                task = _auto_lock_tasks.pop(uid, None)
+                if task and not task.done():
+                    task.cancel()
+                # Send lock notification only if no task already handled it
+                pin_hash = db_get_pin(uid)
+                if not pin_hash:
+                    continue
                 try:
                     await ctx.bot.send_message(
                         chat_id=uid,
                         text=(
-                            "🔒 *Vault Locked — Your Security Matters*\n\n"
-                            "Your session has expired after "
-                            f"*{SESSION_TTL // 60} minute(s)* of inactivity.\n\n"
-                            "🛡 *Why we lock automatically:*\n"
-                            "• Protects your OTP secrets if you leave your phone unattended\n"
-                            "• Prevents unauthorised access in shared environments\n"
-                            "• Ensures only you can view your 2FA codes\n\n"
-                            "Tap *🔓 Unlock Vault* below to re-enter your passcode "
-                            "and regain access."
+                            "🔒 *Vault Auto-Locked*\n\n"
+                            f"Your session expired after *{SESSION_TTL // 60} min* of inactivity.\n\n"
+                            "Tap *🔓 Unlock Vault* to re-enter your passcode."
                         ),
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=rkb_unlock(),
                     )
-                    log.info("Watchdog: sent lock notification to uid=%s", uid)
                 except TelegramError as te:
                     log.warning("Watchdog: could not notify uid=%s — %s", uid, te)
     except Exception as e:
         log.warning("Watchdog error: %s", e)
-    # Also clean up stale pending_update entries (> 10 min old) from memory
-    # (they hold no sensitive data in plaintext but we keep memory tidy)
-    # No expiry stored — simply cap the dict size
+
+    # ── Memory housekeeping ──────────────────────────────────
     if len(_pending_updates) > 500:
-        keys = list(_pending_updates.keys())[:250]
-        for k in keys:
+        for k in list(_pending_updates.keys())[:250]:
             _pending_updates.pop(k, None)
     if len(_pending_qr) > 100:
-        keys = list(_pending_qr.keys())[:50]
-        for k in keys:
+        for k in list(_pending_qr.keys())[:50]:
             _pending_qr.pop(k, None)
-    # Clean up finished bulk refresh task lists
     for uid_key in list(_bulk_refresh_tasks.keys()):
         _bulk_refresh_tasks[uid_key] = [t for t in _bulk_refresh_tasks[uid_key] if not t.done()]
         if not _bulk_refresh_tasks[uid_key]:
             _bulk_refresh_tasks.pop(uid_key, None)
-
-    # Clean up finished admin reset-reminder tasks
     for req_id in list(_reset_reminder_tasks.keys()):
         if _reset_reminder_tasks[req_id].done():
             _reset_reminder_tasks.pop(req_id, None)
             _reset_admin_msg_ids.pop(req_id, None)
+    # Clean up finished auto-lock tasks
+    for uid_key in list(_auto_lock_tasks.keys()):
+        if _auto_lock_tasks[uid_key].done():
+            _auto_lock_tasks.pop(uid_key, None)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3276,7 +3430,9 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # 25.  MAIN
 # ─────────────────────────────────────────────────────────────
 def main() -> None:
+    global _bot_ref
     app = Application.builder().token(BOT_TOKEN).build()
+    _bot_ref = app.bot
 
     app.add_handler(CommandHandler("start",        cmd_start))
     app.add_handler(CommandHandler("restart",      cmd_restart))
@@ -3289,7 +3445,8 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_error_handler(on_error)
 
-    app.job_queue.run_repeating(watchdog, interval=30, first=10)
+    # Watchdog: cleanup-only pass every 10s (actual auto-lock is per-user via _auto_lock_user)
+    app.job_queue.run_repeating(watchdog, interval=10, first=5)
 
     log.info("NexAuth v5 started — polling.")
     app.run_polling(
