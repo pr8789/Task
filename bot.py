@@ -387,6 +387,7 @@ def db_create_reset_request(uid: int, name: str, username: Optional[str]) -> str
         "name": name,
         "username": username,
         "status": "pending",   # pending → approved / denied
+        "qa": [],              # filled in by the security-question appeal flow
         "ts": datetime.now(timezone.utc),
     })
     return request_id
@@ -409,6 +410,64 @@ def db_update_reset_status(request_id: str, status: str) -> None:
 
 def db_delete_reset_request(request_id: str) -> None:
     col_reset_requests.delete_one({"request_id": request_id})
+
+
+def db_create_reset_request_with_qa(uid: int, name: str, username,
+                                     qa_plain: list) -> str:
+    """Create a reset request that includes plaintext Q&A for admin review."""
+    request_id = base64.urlsafe_b64encode(os.urandom(9)).decode().rstrip("=")
+    col_reset_requests.insert_one({
+        "request_id": request_id,
+        "uid": uid,
+        "name": name,
+        "username": username,
+        "status": "pending",
+        "qa": qa_plain,
+        "ts": datetime.now(timezone.utc),
+    })
+    return request_id
+
+
+# ── Security Questions DB helpers ────────────────────────────
+SECURITY_QUESTIONS = [
+    "What is your recovery email address?",
+    "What was the name of your first pet?",
+    "What is your mother\u2019s maiden name?",
+]
+
+
+
+def db_save_security_answers(uid: int, answers: list) -> None:
+    col_users.update_one(
+        {"uid": uid},
+        {"$set": {
+            # Store encrypted plaintext so admin can compare during appeals
+            "security_answers_enc": [aes_encrypt(a.strip()) for a in answers],
+        }},
+    )
+
+
+def db_get_security_answers_plain(uid: int):
+    """Return list of decrypted plaintext answers, or None if not set."""
+    doc = col_users.find_one({"uid": uid}, {"security_answers_enc": 1})
+    enc_list = (doc or {}).get("security_answers_enc")
+    if not enc_list:
+        return None
+    try:
+        return [aes_decrypt(e) for e in enc_list]
+    except Exception:
+        return None
+
+
+def db_get_security_answers(uid: int):
+    doc = col_users.find_one({"uid": uid}, {"security_answers_enc": 1})
+    return (doc or {}).get("security_answers_enc")
+
+
+def db_has_security_answers(uid: int) -> bool:
+    ans = db_get_security_answers(uid)
+    return bool(ans and len(ans) == len(SECURITY_QUESTIONS))
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -861,7 +920,10 @@ def ikb_admin_reset(request_id: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("✅ Approve Reset", callback_data=f"RESET_APPROVE:{request_id}"),
             InlineKeyboardButton("❌ Deny Reset",    callback_data=f"RESET_DENY:{request_id}"),
-        ]
+        ],
+        [
+            InlineKeyboardButton("💬 Chat with User", callback_data=f"RESET_CHAT:{request_id}"),
+        ],
     ])
 
 
@@ -1804,6 +1866,29 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         try: await update.message.delete()
         except TelegramError: pass
         await _do_confirm_pin(update, ctx, uid, text); return
+    # Security question collection (after PIN set)
+    for _qi, _qs_label in enumerate(SECURITY_QUESTIONS):
+        if state == f"WAIT_SECQ_{_qi + 1}":
+            await _do_secq_answer(update, ctx, uid, text, _qi)
+            return
+    # Security question collection during appeal (before submitting to admin)
+    for _qi, _qs_label in enumerate(SECURITY_QUESTIONS):
+        if state == f"WAIT_APPEAL_SECQ_{_qi + 1}":
+            await _do_appeal_secq_answer(update, ctx, uid, text, _qi)
+            return
+    # User typed "I agree" after security questions verified → submit to admin
+    if state == "WAIT_APPEAL_CONFIRM":
+        if text.strip().lower() == "i agree":
+            qa_plain = ctx.user_data.pop("appeal_qa_plain", [])
+            ctx.user_data.clear()
+            await _submit_appeal_to_admin(update, ctx, uid, qa_plain)
+        else:
+            await update.effective_chat.send_message(
+                "⚠️ Please type *I agree* to submit your reset request, or tap ❌ Cancel to abort.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_cancel(),
+            )
+        return
 
     # ── MAIN MENU BUTTONS ───────────────────────────────────
     if text == "➕ Add Account":
@@ -2466,6 +2551,30 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         request_id = data.split(":", 1)[1]
         await _do_admin_deny_reset(q, ctx, request_id)
 
+    # ── RESET CHAT (admin clicks to open chat with user) ────
+    elif data.startswith("RESET_CHAT:"):
+        if uid != ADMIN_ID:
+            await q.message.reply_text("⛔ Admin only.")
+            return
+        request_id = data.split(":", 1)[1]
+        req = db_get_reset_request(request_id)
+        if not req:
+            await q.answer("⚠️ Request not found.", show_alert=True)
+            return
+        user_id = req["uid"]
+        user_name = req.get("name", "User")
+        username = req.get("username")
+        ulink = f"tg://user?id={user_id}"
+        await q.answer("Opening chat link…", show_alert=False)
+        await q.message.reply_text(
+            f"💬 *Chat with {user_name}*\n\n"
+            f"Tap the link below to open a direct chat:\n"
+            f"[Open chat with {user_name}]({ulink})\n\n"
+            f"_User ID: `{user_id}`"
+            + (f"\nUsername: @{username}`" if username else "") + "_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
     # ── RESET AGREE (user clicks after admin approves) ──────
     elif data.startswith("RESET_AGREE:"):
         request_id = data.split(":", 1)[1]
@@ -3011,14 +3120,53 @@ async def _do_set_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     )
 
 
+
+
+async def _do_secq_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                           uid: int, text: str, q_index: int) -> None:
+    """Collect user answer for security question q_index (0-based)."""
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+
+    answers_key = "secq_answers"
+    answers = ctx.user_data.setdefault(answers_key, [])
+    answers.append(text)
+
+    next_index = q_index + 1
+    if next_index < len(SECURITY_QUESTIONS):
+        ctx.user_data["state"] = f"WAIT_SECQ_{next_index + 1}"
+        await update.effective_chat.send_message(
+            f"✅ Saved.\n\n"
+            f"*Question {next_index + 1} of {len(SECURITY_QUESTIONS)}:*\n"
+            f"_{SECURITY_QUESTIONS[next_index]}_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_cancel_settings(),
+        )
+    else:
+        # All answers collected — save and finish
+        db_save_security_answers(uid, answers)
+        ctx.user_data.clear()
+        audit(uid, "security_questions_set")
+        log.info("Security questions set uid=%s", uid)
+        await update.effective_chat.send_message(
+            "🛡 *Security questions saved!*\n\n"
+            "Your vault is now locked. Please unlock it with your new passcode.\n\n"
+            "_These answers will be used to verify your identity during a passcode reset appeal._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_unlock(),
+        )
+
+
 async def _do_confirm_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                           uid: int, text: str) -> None:
     pending = ctx.user_data.pop("pending_pin", None)
-    ctx.user_data.clear()
     if not pending:
         await update.effective_chat.send_message("⚠️ Session lost.", reply_markup=rkb_home())
         return
     if text != pending:
+        ctx.user_data.clear()
         await update.effective_chat.send_message(
             "❌ *PINs do not match.* Try again via ⚙️ Settings → 🔑 Set Passcode.",
             parse_mode=ParseMode.MARKDOWN,
@@ -3026,18 +3174,22 @@ async def _do_confirm_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         )
         return
     db_set_pin(uid, hash_pin(pending))
-    # Security: kill the session so the user must re-enter the NEW PIN immediately.
-    # This prevents an attacker who changed the PIN on an unlocked device from
-    # leaving the vault open indefinitely.
     session_kill(uid)
     ctx.user_data.clear()
+    log.info("PIN set uid=%s — session killed, collecting security questions", uid)
+
+    # ── Proceed to security question setup ──────────────────
+    ctx.user_data["state"]       = "WAIT_SECQ_1"
+    ctx.user_data["back"]        = "settings"
     await update.effective_chat.send_message(
         "✅ *Passcode set!*\n\n"
-        "🔒 Your vault has been locked. Please unlock it with your new passcode.",
+        "🔒 For account recovery, please answer *2 security questions*.\n"
+        "These will be used to verify your identity if you ever forget your passcode.\n\n"
+        f"*Question 1 of {len(SECURITY_QUESTIONS)}:*\n"
+        f"_{SECURITY_QUESTIONS[0]}_",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=rkb_unlock(),
+        reply_markup=rkb_cancel_settings(),
     )
-    log.info("PIN set uid=%s — session killed, re-lock enforced", uid)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3046,7 +3198,7 @@ async def _do_confirm_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 import random
 import string
 
-TEMP_PIN_DELAY_S = 300   # 5 minutes before temp passcode is sent
+TEMP_PIN_DELAY_S = 120   # 2 minutes before temp passcode is sent
 
 
 def _generate_temp_pin(length: int = 8) -> str:
@@ -3077,11 +3229,78 @@ async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: 
         )
         return
 
+    # If user never set security questions, submit directly with a note to admin
+    if not db_has_security_answers(uid):
+        await _submit_appeal_to_admin(update, ctx, uid, qa_plain=[])
+        return
+
+    # Start the security question collection flow
+    ctx.user_data["appeal_answers"] = []
+    ctx.user_data["state"] = "WAIT_APPEAL_SECQ_1"
+    await update.effective_chat.send_message(
+        "🆘 *Passcode Reset Appeal*\n\n"
+        "Please answer your security questions so the admin can verify your identity.\n\n"
+        f"*Question 1 of {len(SECURITY_QUESTIONS)}:*\n"
+        f"_{SECURITY_QUESTIONS[0]}_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_cancel(),
+    )
+
+
+async def _do_appeal_secq_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                  uid: int, text: str, q_index: int) -> None:
+    """Collect appeal answer for security question q_index (0-based)."""
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+
+    answers = ctx.user_data.setdefault("appeal_answers", [])
+    answers.append(text)
+
+    next_index = q_index + 1
+    if next_index < len(SECURITY_QUESTIONS):
+        ctx.user_data["state"] = f"WAIT_APPEAL_SECQ_{next_index + 1}"
+        await update.effective_chat.send_message(
+            f"*Question {next_index + 1} of {len(SECURITY_QUESTIONS)}:*\n"
+            f"_{SECURITY_QUESTIONS[next_index]}_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_cancel(),
+        )
+        return
+
+    # All answers collected — go straight to confirm, no local verification
+    collected_answers = ctx.user_data.pop("appeal_answers", [])
+    ctx.user_data.pop("state", None)
+
+    qa_plain = [
+        {"q": SECURITY_QUESTIONS[i], "a": collected_answers[i]}
+        for i in range(len(SECURITY_QUESTIONS))
+    ]
+    ctx.user_data["appeal_qa_plain"] = qa_plain
+    ctx.user_data["state"] = "WAIT_APPEAL_CONFIRM"
+    qa_display = "\n".join(
+        f"  *Q{i+1}:* {qa_plain[i]['q']}\n  *A:* `{qa_plain[i]['a']}`"
+        for i in range(len(qa_plain))
+    )
+    await update.effective_chat.send_message(
+        "📋 *Your answers:*\n\n"
+        + qa_display + "\n\n"
+        "These answers (alongside your originally saved answers) will be sent to the admin for comparison.\n\n"
+        "_Type_ *I agree* _to submit, or tap ❌ Cancel to abort._",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_cancel(),
+    )
+
+
+async def _submit_appeal_to_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                   uid: int, qa_plain: list) -> None:
+    """Create a reset request and notify the admin with the Q&A."""
     user = update.effective_user
-    request_id = db_create_reset_request(uid, user.first_name, user.username)
+    request_id = db_create_reset_request_with_qa(uid, user.first_name, user.username, qa_plain)
     audit(uid, "reset_appeal")
 
-    # Notify the user
+    # Tell user their request was submitted
     await update.effective_chat.send_message(
         "🆘 *Passcode Reset Request Submitted*\n\n"
         "Your appeal has been sent to the admin for review.\n\n"
@@ -3093,8 +3312,23 @@ async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: 
         reply_markup=rkb_unlock(),
     )
 
-    # Notify the admin
+    # Build admin message with Q&A comparison section
     uname_str = f"@{user.username}" if user.username else "_(no username)_"
+    qa_section = ""
+    if qa_plain:
+        stored_plain = db_get_security_answers_plain(uid) or []
+        lines = []
+        for i, item in enumerate(qa_plain):
+            stored_ans = stored_plain[i] if i < len(stored_plain) else "_(not stored)_"
+            lines.append(
+                f"*Q{i+1}:* {item['q']}\n"
+                f"  📂 *Stored answer:*  `{stored_ans}`\n"
+                f"  ✏️ *User's answer:* `{item['a']}`"
+            )
+        qa_section = "\n\n🔍 *Security Q&A Comparison:*\n" + "\n\n".join(lines)
+    else:
+        qa_section = "\n\n⚠️ _No security questions were set for this user._"
+
     try:
         admin_msg = await ctx.bot.send_message(
             chat_id=ADMIN_ID,
@@ -3104,9 +3338,9 @@ async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: 
                 f"👤 *Name:*     {user.first_name}\n"
                 f"🔗 *Username:* {uname_str}\n"
                 f"🆔 *User ID:*  `{uid}`\n"
-                f"🕐 *Time:*     {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-                "Please verify the user's identity by chatting with them.\n"
-                "Once satisfied, tap ✅ Approve or ❌ Deny below."
+                f"🕐 *Time:*     {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                + qa_section + "\n\n"
+                "Tap ✅ Approve or ❌ Deny, or 💬 Chat to talk to the user first."
             ),
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=ikb_admin_reset(request_id),
@@ -3114,31 +3348,20 @@ async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: 
         _reset_admin_msg_ids[request_id] = admin_msg.message_id
         log.info("Reset appeal uid=%s request_id=%s — admin notified", uid, request_id)
 
-        # ── Auto-reminder: if admin doesn't react within 30s, resend & delete old ──
+        # ── Auto-reminder every 30 s while pending ──────────
         async def _admin_reminder_loop(req_id: str, first_msg_id: int,
-                                       u_first_name: str, u_username: str,
-                                       u_uid: int) -> None:
-            """
-            Repeatedly reminds the admin every 30 s as long as the request
-            stays 'pending'. Each cycle:
-              1. Wait 30 s.
-              2. Re-check DB — if no longer pending, stop.
-              3. Send a fresh notification (capturing the new message_id).
-              4. After another 10 s delete the old message (40 s total age).
-            """
+                                       u_first_name: str, u_username,
+                                       u_uid: int, qa_sec: str) -> None:
             old_msg_id = first_msg_id
             uname_display = f"@{u_username}" if u_username else "_(no username)_"
             attempt = 1
             while True:
                 await asyncio.sleep(30)
-
                 req_check = db_get_reset_request(req_id)
                 if not req_check or req_check.get("status") != "pending":
-                    # Admin already acted — clean up and exit
                     _reset_reminder_tasks.pop(req_id, None)
                     _reset_admin_msg_ids.pop(req_id, None)
                     return
-
                 attempt += 1
                 try:
                     new_msg = await ctx.bot.send_message(
@@ -3149,7 +3372,8 @@ async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: 
                             f"👤 *Name:*     {u_first_name}\n"
                             f"🔗 *Username:* {uname_display}\n"
                             f"🆔 *User ID:*  `{u_uid}`\n"
-                            f"🕐 *Time:*     {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+                            f"🕐 *Time:*     {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                            + qa_sec + "\n\n"
                             "⚠️ _This request is still awaiting your decision._\n"
                             "Please tap ✅ Approve or ❌ Deny below."
                         ),
@@ -3157,26 +3381,21 @@ async def _do_appeal_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: 
                         reply_markup=ikb_admin_reset(req_id),
                     )
                     _reset_admin_msg_ids[req_id] = new_msg.message_id
-                    log.info(
-                        "Reset reminder #%d sent uid=%s request_id=%s",
-                        attempt, u_uid, req_id,
-                    )
+                    log.info("Reset reminder #%d sent uid=%s request_id=%s", attempt, u_uid, req_id)
                 except TelegramError as te:
                     log.warning("Could not send reset reminder: %s", te)
                     _reset_reminder_tasks.pop(req_id, None)
                     return
-
-                # Delete the OLD message 10 s after the new one arrives (= ~40 s after it was sent)
                 await asyncio.sleep(10)
                 try:
                     await ctx.bot.delete_message(chat_id=ADMIN_ID, message_id=old_msg_id)
                 except TelegramError:
-                    pass  # already deleted or too old — ignore
+                    pass
                 old_msg_id = new_msg.message_id
 
         task = asyncio.create_task(
             _admin_reminder_loop(request_id, admin_msg.message_id,
-                                 user.first_name, user.username, uid)
+                                 user.first_name, user.username, uid, qa_section)
         )
         _reset_reminder_tasks[request_id] = task
 
@@ -3224,7 +3443,7 @@ async def _do_admin_approve_reset(q, ctx, request_id: str) -> None:
                 "The admin has verified your identity and approved your request.\n\n"
                 "🔐 *What happens next:*\n"
                 "• Tap *I Agree* below to confirm you want to proceed\n"
-                "• After *5 minutes*, the bot will send you a temporary passcode\n"
+                "• After *2 minutes*, the bot will send you a temporary passcode\n"
                 "• Use that temporary passcode to unlock your vault\n"
                 "• You will then be prompted to set a new permanent passcode\n\n"
                 "⚠️ _Do not share the temporary passcode with anyone._"
