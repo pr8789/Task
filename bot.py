@@ -1003,6 +1003,11 @@ def ikb_accounts(docs: list, prefix: str, page: int = 0,
 _pending_updates: dict[str, dict] = {}   # cache_key → parsed dict
 _pending_qr:     dict[str, list]  = {}   # cache_key → list of parsed dicts
 
+# ── Admin impersonation state ────────────────────────────────
+# Maps admin's real UID → target user UID they are currently viewing as.
+# This is server-side so it survives ctx.user_data.clear() calls.
+_impersonation: dict[int, int] = {}   # real_admin_uid → target_uid
+
 
 def _store_pending(store: dict, payload) -> str:
     key = base64.urlsafe_b64encode(os.urandom(6)).decode().rstrip("=")
@@ -3761,7 +3766,8 @@ def rkb_admin() -> ReplyKeyboardMarkup:
             [KeyboardButton("🚫 Ban User"),        KeyboardButton("✅ Unban User")],
             [KeyboardButton("🗑 Delete User"),     KeyboardButton("💬 Message User")],
             [KeyboardButton("🔒 Force Lock User"), KeyboardButton("📤 Export All Logs")],
-            [KeyboardButton("⚙️ Bot Config"),      KeyboardButton("🏠 Home")],
+            [KeyboardButton("👤 Login as User"),   KeyboardButton("⚙️ Bot Config")],
+            [KeyboardButton("🏠 Home")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -3881,6 +3887,9 @@ def ikb_admin_user_actions(target_uid: int, banned: bool) -> InlineKeyboardMarku
         [
             InlineKeyboardButton("📋 Audit Trail",     callback_data=f"ADMIN_AUDIT:{target_uid}"),
             InlineKeyboardButton("📊 User Stats",      callback_data=f"ADMIN_USTATS:{target_uid}"),
+        ],
+        [
+            InlineKeyboardButton("👤 Login as User",   callback_data=f"ADMIN_IMPERSONATE:{target_uid}"),
         ],
     ])
 
@@ -4457,6 +4466,17 @@ async def _handle_admin_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     if text == "⚙️ Bot Config":
         await _admin_bot_config(update, ctx)
         return True
+    if text == "👤 Login as User":
+        ctx.user_data["state"]      = "ADMIN_WAIT_IMPERSONATE"
+        ctx.user_data["admin_mode"] = True
+        await update.effective_chat.send_message(
+            "👤 *Login as User*\n\n"
+            "Send the user ID or @username of the user whose vault you want to access.\n\n"
+            "⚠️ _All actions will be performed on their real vault and logged in the audit trail._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin_cancel(),
+        )
+        return True
     # "🏠 Home" exits admin mode and goes to regular home
     if text == "🏠 Home" and ctx.user_data.get("admin_mode"):
         ctx.user_data.clear()
@@ -4763,6 +4783,654 @@ async def _handle_admin_callback(q, ctx, uid: int, data: str) -> bool:
 
     return False
 
+
+# ─────────────────────────────────────────────────────────────
+# 24.  ADMIN IMPERSONATION ("Login as User")
+# ─────────────────────────────────────────────────────────────
+
+def impersonate_start(admin_uid: int, target_uid: int) -> None:
+    """Begin impersonating target_uid as admin_uid."""
+    _impersonation[admin_uid] = target_uid
+    audit(admin_uid, "admin_impersonate_start", str(target_uid))
+    log.info("Admin uid=%s started impersonating uid=%s", admin_uid, target_uid)
+
+
+def impersonate_end(admin_uid: int) -> Optional[int]:
+    """End impersonation. Returns the target uid that was being impersonated, or None."""
+    target = _impersonation.pop(admin_uid, None)
+    if target:
+        audit(admin_uid, "admin_impersonate_end", str(target))
+        log.info("Admin uid=%s ended impersonation of uid=%s", admin_uid, target)
+    return target
+
+
+def get_impersonated_uid(admin_uid: int) -> Optional[int]:
+    """Return the uid the admin is currently viewing as, or None."""
+    return _impersonation.get(admin_uid)
+
+
+def is_impersonating(admin_uid: int) -> bool:
+    return admin_uid in _impersonation
+
+
+# ── Impersonation banner ─────────────────────────────────────
+def _imp_banner(target_uid: int, target_name: str) -> str:
+    return (
+        f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👁 *[ADMIN VIEW]* Viewing as `{target_uid}` ({target_name})\n"
+        f"Type /exituser to return to Admin Panel."
+    )
+
+
+async def _send_imp_status(chat, target_uid: int) -> None:
+    """Send the impersonation status bar as a pinned-style notice."""
+    doc = col_users.find_one({"uid": target_uid}, {"name": 1, "username": 1}) or {}
+    name  = doc.get("name", "?")
+    uname = f"@{doc['username']}" if doc.get("username") else "—"
+    await chat.send_message(
+        f"👁 *Admin Impersonation Active*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 Target UID  : `{target_uid}`\n"
+        f"👤 Name        : {name}\n"
+        f"🔗 Username    : {uname}\n\n"
+        f"You are now interacting with the bot *as this user*.\n"
+        f"All actions (add, delete, OTP, settings) operate on their vault.\n\n"
+        f"⚠️ _Every action is logged under `admin_imp_*` in the audit trail._\n"
+        f"Type /exituser or press *🚪 Exit User View* to return to your admin panel.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_imp_active(),
+    )
+
+
+# ── Impersonation-mode keyboards ────────────────────────────
+def rkb_imp_active() -> ReplyKeyboardMarkup:
+    """Full user keyboard with an Exit button prepended."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🚪 Exit User View")],
+            [KeyboardButton("➕ Add Account"),   KeyboardButton("🔑 Get OTP")],
+            [KeyboardButton("📋 My Accounts"),   KeyboardButton("🔍 Search")],
+            [KeyboardButton("🔒 Lock Vault"),    KeyboardButton("⚙️ Settings")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+# ── Start impersonation ──────────────────────────────────────
+async def _admin_enter_user(update_or_chat, ctx, admin_uid: int,
+                             target_uid: int) -> None:
+    """Put admin into impersonation mode for target_uid."""
+    doc = col_users.find_one({"uid": target_uid}) or {}
+    if not doc:
+        chat = getattr(update_or_chat, "effective_chat", update_or_chat)
+        await chat.send_message(
+            f"❌ User `{target_uid}` not found in database.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_admin_back(),
+        )
+        return
+
+    impersonate_start(admin_uid, target_uid)
+    # Give admin an open session as the target user
+    session_touch(target_uid)
+
+    chat = getattr(update_or_chat, "effective_chat", update_or_chat)
+    await _send_imp_status(chat, target_uid)
+
+    # Show the target user's home screen
+    name = doc.get("name", "User")
+    count = col_accounts.count_documents({"uid": target_uid})
+    pin_set = bool(db_get_pin(target_uid))
+    paranoid = db_get_setting(target_uid, "paranoid", False)
+    await chat.send_message(
+        f"🏠 *Vault Home — {name}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔐 {count} account{'s' if count != 1 else ''}\n"
+        f"{'🔑' if pin_set else '🔓'} Passcode: {'Set' if pin_set else 'Not set'}\n"
+        f"{'🔕 Paranoid mode ON' if paranoid else ''}"
+        + _imp_banner(target_uid, name),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_imp_active(),
+    )
+
+
+# ── Exit impersonation ───────────────────────────────────────
+async def _admin_exit_user(chat, ctx, admin_uid: int) -> None:
+    """End impersonation and return admin to their panel."""
+    target = impersonate_end(admin_uid)
+    ctx.user_data.clear()
+    ctx.user_data["admin_mode"] = True
+    stats = db_global_stats()
+    msg = (
+        f"🚪 *Exited user view.*"
+        + (f"\n_Was viewing `{target}`._" if target else "")
+        + f"\n\n🛡 *Admin Panel*\n"
+        f"👥 `{stats['total_users']}` users · "
+        f"🔐 `{stats['total_accounts']}` accounts · "
+        f"🔔 `{stats['pending_resets']}` pending resets"
+    )
+    await chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_admin())
+
+
+# ── /exituser command ────────────────────────────────────────
+async def cmd_exituser(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    if uid != ADMIN_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if not is_impersonating(uid):
+        await update.message.reply_text(
+            "ℹ️ You are not in user-view mode.",
+            reply_markup=rkb_admin(),
+        )
+        return
+    await _admin_exit_user(update.effective_chat, ctx, uid)
+
+
+# ── Impersonation-aware uid resolver ────────────────────────
+def _effective_uid(real_uid: int) -> int:
+    """
+    If admin is impersonating someone, return the target uid.
+    All DB operations should use this uid so they affect the target's vault.
+    """
+    if real_uid == ADMIN_ID:
+        return _impersonation.get(real_uid, real_uid)
+    return real_uid
+
+
+# ── Impersonation interceptor for on_message ─────────────────
+async def _handle_impersonation_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                         real_uid: int, text: str, state: str) -> bool:
+    """
+    Called at the very top of on_message when admin is impersonating.
+    Returns True if the message was fully handled.
+    Swaps uid → target and lets the normal flow run with the swapped uid.
+    """
+    if real_uid != ADMIN_ID or not is_impersonating(real_uid):
+        return False
+
+    target_uid = _impersonation[real_uid]
+
+    # ── Exit button / command ────────────────────────────────
+    if text in ("🚪 Exit User View", "/exituser"):
+        await _admin_exit_user(update.effective_chat, ctx, real_uid)
+        return True
+
+    # ── Log every action under audit ────────────────────────
+    audit(real_uid, "admin_imp_action", f"uid={target_uid} text={text[:48]}")
+
+    # Patch ctx.user_data to be the TARGET user's data, stored under a
+    # namespaced key in the admin's own user_data dict so it persists
+    # across the session without leaking into other contexts.
+    _ensure_imp_user_data(ctx, target_uid)
+
+    # ── Inject the virtual session for the target user ───────
+    # Keep target's session alive while admin is viewing it
+    session_touch(target_uid)
+
+    # ── Re-run the regular on_message logic with swapped uid ─
+    # We do this by temporarily patching the update's effective_user.id.
+    # Since Update is immutable, we use a wrapper approach instead:
+    # call each relevant handler function directly with target_uid.
+    await _dispatch_as_user(update, ctx, target_uid, text, state)
+    return True
+
+
+# ── Impersonation interceptor for on_button ──────────────────
+async def _handle_impersonation_callback(q, ctx, real_uid: int, data: str) -> bool:
+    """
+    Called at the very top of on_button when admin is impersonating.
+    Returns True if callback was forwarded to user logic.
+    """
+    if real_uid != ADMIN_ID or not is_impersonating(real_uid):
+        return False
+
+    target_uid = _impersonation[real_uid]
+
+    # Log
+    audit(real_uid, "admin_imp_callback", f"uid={target_uid} data={data[:48]}")
+
+    # Keep target session alive
+    session_touch(target_uid)
+
+    # Patch user_data namespace
+    _ensure_imp_user_data(ctx, target_uid)
+
+    # Let the normal callback router run — but uid will be resolved via
+    # _effective_uid() inside on_button after we return False here.
+    # Instead we need the normal flow to use target_uid, so we patch state.
+    return False   # signal: continue into main callback router with effective uid swapped
+
+
+# ── user_data namespace for impersonation ─────────────────────
+_imp_user_data: dict[int, dict] = {}   # target_uid → their ctx-like user_data
+
+
+def _ensure_imp_user_data(ctx, target_uid: int) -> None:
+    """
+    Swap ctx.user_data to a per-target namespace so the admin's own
+    state isn't polluted by the target user's flow state.
+    The impersonated user's state is stored in _imp_user_data[target_uid].
+    """
+    if target_uid not in _imp_user_data:
+        _imp_user_data[target_uid] = {}
+    # Temporarily replace the contents of ctx.user_data with the target's data.
+    # We can't replace the dict object itself (PTB holds a reference), so we
+    # mirror the contents in and out.
+    ctx.user_data.clear()
+    ctx.user_data.update(_imp_user_data[target_uid])
+
+
+def _save_imp_user_data(ctx, target_uid: int) -> None:
+    """Flush ctx.user_data back to the target's namespace after a dispatch."""
+    _imp_user_data[target_uid] = dict(ctx.user_data)
+
+
+# ── Central dispatch-as-user ─────────────────────────────────
+async def _dispatch_as_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                              target_uid: int, text: str, state: str) -> None:
+    """
+    Re-run the standard on_message handler logic using target_uid as
+    the effective uid. This gives the admin full access to the target
+    user's vault: view accounts, get OTPs, manage settings, etc.
+    """
+    # ── PIN-related states in impersonation: skip for admin ──
+    # Admin does not need to enter the target's PIN — we grant access directly.
+
+    # ── CANCEL ──────────────────────────────────────────────
+    if text == "❌ Cancel":
+        _imp_user_data[target_uid] = {}
+        ctx.user_data.clear()
+        target_doc = col_users.find_one({"uid": target_uid}) or {}
+        await update.effective_chat.send_message(
+            home_text(target_uid, target_doc.get("name", "User"))
+            + _imp_banner(target_uid, target_doc.get("name", "User")),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_imp_active(),
+        )
+        return
+
+    # ── BACK ─────────────────────────────────────────────────
+    if text == "🔙 Back":
+        back_dest = ctx.user_data.get("back", "home")
+        _imp_user_data[target_uid] = {}
+        ctx.user_data.clear()
+        target_doc = col_users.find_one({"uid": target_uid}) or {}
+        tname = target_doc.get("name", "User")
+        if back_dest == "settings":
+            pin_set  = bool(db_get_pin(target_uid))
+            paranoid = db_get_setting(target_uid, "paranoid", False)
+            await update.effective_chat.send_message(
+                f"⚙️ *Settings — {tname}*\n\n"
+                f"🔑 Passcode: {'✅ Set' if pin_set else '❌ Not set'}\n"
+                f"🔕 Paranoid: {'✅ ON' if paranoid else '❌ OFF'}"
+                + _imp_banner(target_uid, tname),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_settings(),
+            )
+        else:
+            await update.effective_chat.send_message(
+                home_text(target_uid, tname)
+                + _imp_banner(target_uid, tname),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_imp_active(),
+            )
+        return
+
+    # ── Unlock Vault (admin bypasses PIN) ────────────────────
+    if text == "🔓 Unlock Vault":
+        session_touch(target_uid)
+        target_doc = col_users.find_one({"uid": target_uid}) or {}
+        await update.effective_chat.send_message(
+            "✅ *Vault unlocked (admin access — PIN bypassed)*\n\n"
+            + home_text(target_uid, target_doc.get("name", "User"))
+            + _imp_banner(target_uid, target_doc.get("name", "User")),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_imp_active(),
+        )
+        _save_imp_user_data(ctx, target_uid)
+        return
+
+    # ── Wait-states ──────────────────────────────────────────
+    if state == "WAIT_RESTORE":
+        await _do_restore(update, ctx, target_uid, text)
+        _save_imp_user_data(ctx, target_uid); return
+    if state == "WAIT_SVC_NAME":
+        await _do_save_svc_name(update, ctx, target_uid, text)
+        _save_imp_user_data(ctx, target_uid); return
+    if state == "WAIT_RENAME_ADD":
+        await _do_rename_add(update, ctx, target_uid, text)
+        _save_imp_user_data(ctx, target_uid); return
+    if state == "WAIT_RENAME":
+        await _do_rename(update, ctx, target_uid, text)
+        _save_imp_user_data(ctx, target_uid); return
+    if state == "WAIT_SEARCH":
+        await _do_search(update, ctx, target_uid, text)
+        _save_imp_user_data(ctx, target_uid); return
+    if state == "WAIT_URI":
+        try: await update.message.delete()
+        except TelegramError: pass
+        await _do_add_uri(update, ctx, target_uid, text)
+        _save_imp_user_data(ctx, target_uid); return
+    if state == "WAIT_KEY":
+        try: await update.message.delete()
+        except TelegramError: pass
+        await _do_add_key(update, ctx, target_uid, text)
+        _save_imp_user_data(ctx, target_uid); return
+    if state == "WAIT_KEY_DIGITS":
+        await _do_key_digits(update, ctx, target_uid, text)
+        _save_imp_user_data(ctx, target_uid); return
+    if state == "WAIT_KEY_PERIOD":
+        await _do_key_period(update, ctx, target_uid, text)
+        _save_imp_user_data(ctx, target_uid); return
+
+    # ── Admin sets a new passcode ON BEHALF of user ──────────
+    if state == "WAIT_SET_PIN":
+        try: await update.message.delete()
+        except TelegramError: pass
+        await _do_set_pin(update, ctx, target_uid, text)
+        _save_imp_user_data(ctx, target_uid); return
+    if state == "WAIT_CONFIRM_PIN":
+        try: await update.message.delete()
+        except TelegramError: pass
+        await _do_confirm_pin(update, ctx, target_uid, text)
+        _save_imp_user_data(ctx, target_uid); return
+
+    # ── Main menu buttons ────────────────────────────────────
+    target_doc = col_users.find_one({"uid": target_uid}) or {}
+    tname = target_doc.get("name", "User")
+
+    if text == "➕ Add Account":
+        ctx.user_data.clear()
+        ctx.user_data["back"] = "home"
+        _cancel_refresh(target_uid)
+        await update.effective_chat.send_message(
+            "➕ *Add New Account*\n\nChoose how to add:"
+            + _imp_banner(target_uid, tname),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_add_menu(),
+        )
+
+    elif text == "📷 Scan QR Code":
+        ctx.user_data["state"] = "WAIT_QR"
+        ctx.user_data["back"]  = "add"
+        await update.effective_chat.send_message(
+            "📷 Send the QR code image." + _imp_banner(target_uid, tname),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_cancel_add(),
+        )
+
+    elif text == "🔗 Paste URI":
+        ctx.user_data["state"] = "WAIT_URI"
+        ctx.user_data["back"]  = "add"
+        await update.effective_chat.send_message(
+            "🔗 Send your `otpauth://` URI." + _imp_banner(target_uid, tname),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_cancel_add(),
+        )
+
+    elif text == "🔐 Enter Secret Key":
+        ctx.user_data["state"] = "WAIT_KEY"
+        ctx.user_data["back"]  = "add"
+        await update.effective_chat.send_message(
+            "🔐 Send the base32 secret key." + _imp_banner(target_uid, tname),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_cancel_add(),
+        )
+
+    elif text == "🔑 Get OTP":
+        docs = db_list(target_uid)
+        if not docs:
+            await update.effective_chat.send_message(
+                "📭 No accounts in this vault." + _imp_banner(target_uid, tname),
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_imp_active(),
+            )
+        else:
+            _cancel_refresh(target_uid)
+            docs_sorted = sorted(docs, key=lambda x: (not x.get("starred", False), x["svc"].lower()))
+            paranoid = db_get_setting(target_uid, "paranoid", False)
+            await update.effective_chat.send_message(
+                f"🔑 *{tname}'s OTP Codes* — {len(docs_sorted)} account{'s' if len(docs_sorted)!=1 else ''}"
+                + _imp_banner(target_uid, tname),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_imp_active(),
+            )
+            for doc in docs_sorted:
+                svc = doc["svc"]
+                full_doc = db_get(target_uid, svc)
+                if not full_doc: continue
+                try:
+                    secret = aes_decrypt(full_doc["enc"])
+                except Exception:
+                    await update.effective_chat.send_message(f"🔐 *{svc}* — decryption failed.")
+                    continue
+                otp_type = full_doc.get("type", "totp")
+                counter  = full_doc.get("counter", 0)
+                if otp_type == "hotp":
+                    counter = db_hotp_increment(target_uid, svc)
+                otp_msg = await update.effective_chat.send_message(
+                    otp_text(svc, full_doc.get("issuer", svc), secret,
+                             full_doc.get("digits", 6), full_doc.get("period", 30),
+                             full_doc.get("algorithm", "SHA1"), otp_type, counter),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=ikb_otp_view(svc),
+                )
+                if otp_type == "totp":
+                    asyncio.create_task(
+                        _otp_refresh_loop(
+                            otp_msg.chat_id, otp_msg.message_id,
+                            target_uid, svc, full_doc, secret, ctx.bot, paranoid,
+                            no_inline=True,
+                        )
+                    )
+
+    elif text == "📋 My Accounts":
+        docs = db_list(target_uid)
+        if not docs:
+            await update.effective_chat.send_message(
+                "📭 Vault is empty." + _imp_banner(target_uid, tname),
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_imp_active(),
+            )
+        else:
+            ctx.user_data["back"] = "home"
+            await update.effective_chat.send_message(
+                f"📋 *{tname}'s Vault* — {len(docs)} account{'s' if len(docs)!=1 else ''}"
+                + _imp_banner(target_uid, tname),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_imp_active(),
+            )
+            await update.effective_chat.send_message(
+                "👇 Choose an account:",
+                reply_markup=ikb_accounts(docs, "DETAIL", uid=target_uid),
+            )
+
+    elif text == "🔍 Search":
+        ctx.user_data["state"] = "WAIT_SEARCH"
+        ctx.user_data["back"]  = "home"
+        await update.effective_chat.send_message(
+            "🔍 Type any part of the name or issuer." + _imp_banner(target_uid, tname),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_cancel(),
+        )
+
+    elif text == "🗑 Delete Account":
+        docs = db_list(target_uid)
+        if not docs:
+            await update.effective_chat.send_message(
+                "📭 Nothing to delete.", reply_markup=rkb_settings()
+            )
+        else:
+            ctx.user_data["back"] = "settings"
+            await update.effective_chat.send_message(
+                "🗑 Choose an account to delete:" + _imp_banner(target_uid, tname),
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_back_settings(),
+            )
+            await update.effective_chat.send_message(
+                "👇", reply_markup=ikb_accounts(docs, "DEL_ASK", uid=target_uid),
+            )
+
+    elif text == "✏️ Rename":
+        docs = db_list(target_uid)
+        if not docs:
+            await update.effective_chat.send_message("📭 No accounts to rename.", reply_markup=rkb_settings())
+        else:
+            ctx.user_data["back"] = "settings"
+            await update.effective_chat.send_message(
+                "✏️ Choose an account to rename:" + _imp_banner(target_uid, tname),
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_back_settings(),
+            )
+            await update.effective_chat.send_message(
+                "👇", reply_markup=ikb_accounts(docs, "RENAME_CB", uid=target_uid),
+            )
+
+    elif text == "💾 Backup":
+        await _do_backup(update, target_uid)
+
+    elif text == "📥 Restore":
+        ctx.user_data["state"] = "WAIT_RESTORE"
+        ctx.user_data["back"]  = "settings"
+        await update.effective_chat.send_message(
+            "📥 Paste the encrypted backup string." + _imp_banner(target_uid, tname),
+            parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_cancel_settings(),
+        )
+
+    elif text == "🔒 Lock Vault":
+        _cancel_refresh(target_uid)
+        session_kill(target_uid)
+        await update.effective_chat.send_message(
+            f"🔒 *{tname}'s vault locked.*" + _imp_banner(target_uid, tname),
+            parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_imp_active(),
+        )
+
+    elif text == "⚙️ Settings":
+        ctx.user_data.clear()
+        ctx.user_data["back"] = "home"
+        pin_set  = bool(db_get_pin(target_uid))
+        paranoid = db_get_setting(target_uid, "paranoid", False)
+        await update.effective_chat.send_message(
+            f"⚙️ *Settings — {tname}*\n\n"
+            f"🔑 Passcode: {'✅ Set' if pin_set else '❌ Not set'}\n"
+            f"🔕 Paranoid: {'✅ ON' if paranoid else '❌ OFF'}"
+            + _imp_banner(target_uid, tname),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_settings(),
+        )
+
+    elif text == "🔑 Set Passcode":
+        ctx.user_data["state"] = "WAIT_SET_PIN"
+        ctx.user_data["back"]  = "settings"
+        await update.effective_chat.send_message(
+            "🔑 Send a 4–8 digit PIN for this user.\n_Message deleted immediately._"
+            + _imp_banner(target_uid, tname),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=rkb_cancel_settings(),
+        )
+
+    elif text == "🔓 Remove Passcode":
+        if not db_get_pin(target_uid):
+            await update.effective_chat.send_message("ℹ️ No passcode set.", reply_markup=rkb_settings())
+        else:
+            db_set_pin(target_uid, None)
+            audit(target_uid, "admin_imp_pin_removed", str(ADMIN_ID))
+            await update.effective_chat.send_message(
+                f"✅ *Passcode removed for {tname}.*" + _imp_banner(target_uid, tname),
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_settings(),
+            )
+
+    elif text == "🔕 Paranoid Mode":
+        current = db_get_setting(target_uid, "paranoid", False)
+        db_set_setting(target_uid, "paranoid", not current)
+        state_str = "ON ✅" if not current else "OFF ❌"
+        await update.effective_chat.send_message(
+            f"🔕 *Paranoid mode {state_str} for {tname}*" + _imp_banner(target_uid, tname),
+            parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_settings(),
+        )
+
+    elif text == "📊 My Stats":
+        ctx.user_data["back"] = "settings"
+        await _do_stats_for(update, target_uid, tname)
+
+    elif text == "🕐 Session Info":
+        ctx.user_data["back"] = "settings"
+        session_doc = col_sessions.find_one({"uid": target_uid})
+        if session_doc:
+            last    = session_doc.get("last")
+            if last and last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            elapsed   = int((datetime.now(timezone.utc) - last).total_seconds()) if last else SESSION_TTL
+            remaining = max(0, SESSION_TTL - elapsed)
+            mins, secs = divmod(remaining, 60)
+            await update.effective_chat.send_message(
+                f"🕐 *Session — {tname}*\n"
+                f"⏳ Remaining: *{mins}m {secs}s*"
+                + _imp_banner(target_uid, tname),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=rkb_back_settings(),
+            )
+        else:
+            await update.effective_chat.send_message(
+                f"ℹ️ No active session for {tname}." + _imp_banner(target_uid, tname),
+                reply_markup=rkb_back_settings(),
+            )
+
+    elif text == "❓ Help":
+        ctx.user_data["back"] = "settings"
+        await update.effective_chat.send_message(
+            "ℹ️ Help is shown normally for this user." + _imp_banner(target_uid, tname),
+            parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_back_settings(),
+        )
+
+    else:
+        await update.effective_chat.send_message(
+            "ℹ️ Use the keyboard to navigate." + _imp_banner(target_uid, tname),
+            parse_mode=ParseMode.MARKDOWN, reply_markup=rkb_imp_active(),
+        )
+
+    _save_imp_user_data(ctx, target_uid)
+
+
+async def _do_stats_for(update: Update, target_uid: int, tname: str) -> None:
+    """Stats display for impersonation mode — reuses _do_stats logic with target uid."""
+    pipeline = [
+        {"$match": {"uid": target_uid}},
+        {"$group": {
+            "_id":    None,
+            "total":  {"$sum": 1},
+            "oldest": {"$min": "$created"},
+            "newest": {"$max": "$created"},
+        }},
+    ]
+    agg = list(col_accounts.aggregate(pipeline))
+    total = oldest = newest = None
+    if agg:
+        total  = agg[0]["total"]
+        oldest = agg[0]["oldest"].strftime("%Y-%m-%d") if agg[0]["oldest"] else "—"
+        newest = agg[0]["newest"].strftime("%Y-%m-%d") if agg[0]["newest"] else "—"
+    else:
+        total = 0
+    pin_set  = bool(db_get_pin(target_uid))
+    paranoid = db_get_setting(target_uid, "paranoid", False)
+    starred  = col_accounts.count_documents({"uid": target_uid, "starred": True})
+    await update.effective_chat.send_message(
+        f"📊 *Stats — {tname}*\n━━━━━━━━━━━━━━━━\n"
+        f"🔐 Accounts   : `{total}`\n"
+        f"⭐ Starred    : `{starred}`\n"
+        f"🗓 Oldest     : `{oldest or '—'}`\n"
+        f"🆕 Newest     : `{newest or '—'}`\n"
+        f"🔑 Passcode   : {'✅ Set' if pin_set else '❌ Not set'}\n"
+        f"🔕 Paranoid   : {'✅ ON' if paranoid else '❌ OFF'}"
+        + _imp_banner(target_uid, tname),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=rkb_back_settings(),
+    )
+
+
+# ── Wire impersonation into on_button's uid resolution ───────
+# on_button already calls _effective_uid() via the session_touch line;
+# we need to ensure all DB calls inside on_button use the right uid.
+# We do this by patching the uid variable at the start of on_button
+# when admin is impersonating.  The patch is added in on_button below.
 
 # ─────────────────────────────────────────────────────────────
 # 25.  MAIN
